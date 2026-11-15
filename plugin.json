@@ -6,6 +6,6 @@
   "publish": {
     "tags": ["utility", "tv"],
     "description": "CEC alternative over the network for a Sony Bravia TV: wakes it, switches its HDMI input and turns it off when a SteamOS HTPC wakes up, goes to sleep or shuts down. Also controls which USB devices can wake the PC.",
-    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/decky-loader"
+    "image": "https://raw.githubusercontent.com/MSPortnov/NetCEC/main/assets/store.png"
   }
 }
