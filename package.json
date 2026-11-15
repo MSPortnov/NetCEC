@@ -1,0 +1,31 @@
+{
+  "name": "netcec",
+  "version": "1.1.0",
+  "description": "NetCEC: Sony Bravia control and USB wake sources for Decky Loader",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MSPortnov/NetCEC.git"
+  },
+  "homepage": "https://github.com/MSPortnov/NetCEC#readme",
+  "bugs": {
+    "url": "https://github.com/MSPortnov/NetCEC/issues"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "rollup -c",
+    "watch": "rollup -c -w"
+  },
+  "license": "GPL-3.0-or-later",
+  "dependencies": {
+    "@decky/api": "^1.1.2",
+    "react-icons": "^5.3.0"
+  },
+  "devDependencies": {
+    "@decky/rollup": "^1.0.1",
+    "@decky/ui": "^4.8.3",
+    "@types/react": "18.3.3",
+    "@types/react-dom": "18.3.0",
+    "rollup": "^4.22.5",
+    "typescript": "^5.6.2"
+  }
+}
