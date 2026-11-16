@@ -455,15 +455,18 @@ def _power_state(s):
 
 SEND_TIMEOUT = 2    # seconds for every request to the TV while waking / switching
 SWITCH_SENDS = 3    # how many times the input switch is sent before giving up
+HOME_PAUSE = 0.4    # pause between the Home key and the input switch (s)
 WAKE_WINDOW = 45    # how long a sleeping TV may take to wake up (s)
 
 
 def _tv_fast(s):
     """Wake and/or switch the input as early as possible and stop as soon as it is confirmed.
-    The input switch is tried at once (the TV is usually already on, showing its home screen);
-    after every switch the TV is asked which input it shows, and nothing more is sent once it is
-    on the right HDMI port. If the TV is off, it is woken (power on + Wake-on-LAN) every ~3 s
-    and polled until it is active, for up to WAKE_WINDOW seconds."""
+    The TV is asked at once which input it shows (it is usually already on): if that is the right
+    HDMI port nothing is sent. Otherwise the Home key is sent first (it ends a running screensaver,
+    which a plain input switch does not), then the input switch; afterwards the TV is asked again
+    and nothing more is sent once it is on the right port (the switch is repeated up to
+    SWITCH_SENDS times). If the TV is off, it is woken (power on + Wake-on-LAN) every ~3 s and
+    polled until it is active, for up to WAKE_WINDOW seconds."""
     bad = _tv_check(s)
     if bad:
         return bad
@@ -479,6 +482,19 @@ def _tv_fast(s):
             if (first and want_sw) or st == "active":
                 if not want_sw:
                     return _ok(_t("already_on"))
+                cur = _current_port(s, timeout=SEND_TIMEOUT)
+                if cur == port:  # already on the right input: nothing to send
+                    return _ok(_t("switched", port=port))
+                if cur is None and first:  # no answer and the state is unknown: TV off, go and wake it
+                    raise RuntimeError("TV not reachable")
+                if sends == 0:  # the Home key ends a running screensaver; not critical if it fails
+                    try:
+                        _ircc(s, IRCC_HOME, timeout=SEND_TIMEOUT)
+                        time.sleep(HOME_PAUSE)
+                    except AuthError:
+                        raise
+                    except Exception:
+                        pass
                 _rest(s, "avContent", "setPlayContent", [{"uri": f"extInput:hdmi?port={port}"}],
                       timeout=SEND_TIMEOUT)
                 sends += 1

@@ -49,6 +49,20 @@ saves diagnostic logs to `~/Downloads`.
 
 The TV also reacts when the plugin itself starts, so restarting Decky switches the TV on.
 
+## Trying it without a TV
+
+No Sony Bravia at hand? You can still check that the plugin loads and works:
+
+- Open NetCEC from the Quick Access menu. With no IP address the status says *Not configured*; with an
+  address typed in, it says *Not paired*.
+- Type any IP address and press **Show PIN on TV**: with no TV there, the status reports *No connection*
+  (the request failed cleanly, nothing else happens).
+- The **Wake sources (USB)** list shows your USB devices. Switching a device off or on really changes its
+  wake setting, and it is restored after a restart.
+- Set **When going to sleep** to any action: the "Sleep hook" line should say *active* and *lock held*.
+- Change the **Language** and check that the interface and messages follow.
+- The log in `~/homebrew/logs/NetCEC/` shows what the plugin did at start, sleep and resume.
+
 ## If something doesn't work
 
 - **The TV does not turn on.** Check that *Remote start* is enabled on the TV, and that the TV keeps its
@@ -65,9 +79,11 @@ The TV also reacts when the plugin itself starts, so restarting Decky switches t
 - Backend: `main.py` (Python, runs as root: it writes USB wake settings and takes a systemd lock).
   Frontend: `src/index.tsx` (React, built with `pnpm build` into `dist/`).
 - TV control: Sony Bravia IP Control (REST + IRCC), PIN pairing, Wake-on-LAN as a backup wake-up.
-- On start and on resume the plugin sends the wake / input-switch commands right away (2 s timeouts),
-  checks which input the TV shows, and stops as soon as it is on the right port. The input switch is
-  sent at most 3 times; a sleeping TV is woken again every ~3 s for up to 45 s.
+- On start and on resume the plugin sends the wake / input-switch commands right away (2 s timeouts)
+  and stops as soon as the TV shows the right port. If the TV is on another input or on its home screen,
+  the remote's Home key is sent first (it ends a running screensaver) and then the input switch, with a
+  0.4 s pause between them. The input switch is sent at most 3 times; a sleeping TV is woken again
+  every ~3 s for up to 45 s.
 - Sleep and shutdown: the backend follows systemd-logind (`PrepareForSleep` / `PrepareForShutdown`
   via `dbus-monitor`) and holds a short delay lock (`systemd-inhibit`, a few seconds at most) so the TV can
   be turned off before the network goes down. Steam UI events and a clock-jump detector are used as fallbacks.
