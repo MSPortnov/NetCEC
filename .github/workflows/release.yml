@@ -1,0 +1,48 @@
+# Builds the plugin and publishes a GitHub release when a version tag (v1.2.3) is pushed.
+# The release asset is always called NetCEC.zip, so .../releases/latest/download/NetCEC.zip always works.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the tag matches package.json
+        run: |
+          V="$(jq -r .version package.json)"
+          if [ "v$V" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $V"
+            exit 1
+          fi
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      - name: Package
+        run: |
+          mkdir -p out/NetCEC
+          cp -r dist main.py plugin.json package.json LICENSE out/NetCEC/
+          (cd out && zip -qr ../NetCEC.zip NetCEC)
+          sha256sum NetCEC.zip > NetCEC.zip.sha256
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" NetCEC.zip NetCEC.zip.sha256 --title "NetCEC $GITHUB_REF_NAME" --generate-notes

@@ -22,6 +22,34 @@ so you don't need HDMI-CEC. It is a plugin for [Decky Loader](https://decky.xyz/
 - A SteamOS device with Decky Loader installed.
 - A Sony Bravia TV on Android TV, on the same network as the box.
 
+## Installing and updating
+
+The same command installs the plugin and updates it later (it always takes the latest release from GitHub).
+Settings and the TV pairing are kept.
+
+**On the SteamOS machine itself.** Switch to Desktop Mode, open a terminal (Konsole) and run:
+
+    curl -fsSL https://raw.githubusercontent.com/MSPortnov/NetCEC/main/install.sh | bash
+
+The first time you need a password for the `deck` user (set it with `passwd` if you never did): `sudo` asks for it.
+
+**From another computer (macOS or Linux).** One time, on the SteamOS machine, turn SSH on and note its IP address:
+
+    sudo systemctl enable --now sshd
+    ip -4 addr | grep inet
+
+Then, on your computer (put your IP address instead of `192.168.1.101`):
+
+    ssh -t deck@192.168.1.101 'curl -fsSL https://raw.githubusercontent.com/MSPortnov/NetCEC/main/install.sh | bash'
+
+**Without a terminal.** In Decky open Settings > General and turn on *Developer mode*. Then open *Developer*,
+choose *Install Plugin from URL* and paste:
+
+    https://github.com/MSPortnov/NetCEC/releases/latest/download/NetCEC.zip
+
+Installing or updating restarts Decky, and NetCEC switches the TV on when it starts, so the TV may turn on.
+The script is short, [read it here](install.sh) before you run it.
+
 ## Setting up
 
 1. **On the TV:** open Settings > Network > Home network setup > IP control. Set *Authentication* to
@@ -33,21 +61,6 @@ so you don't need HDMI-CEC. It is a plugin for [Decky Loader](https://decky.xyz/
 
 The pairing renews itself every time it is used. If it gets lost (for example you removed the device on the
 TV), the status will ask you to pair again.
-
-## Installing
-
-You need Node.js and pnpm on the box (one time: `nvm install 20 && npm i -g pnpm@9`). Then, in the plugin folder:
-
-    bash update.sh
-
-The script builds the plugin, copies it to `~/homebrew/plugins/NetCEC/` and restarts Decky.
-
-Prefer to build on another computer (Mac or Linux) and install over SSH? Run
-`bash deploy.sh <box IP address>` there instead. Node.js is downloaded automatically if it is missing (pnpm is fetched on the fly),
-the SSH user defaults to `deck` (change it with `DECK_USER=name`), and `bash deploy.sh <IP> logs`
-saves diagnostic logs to `~/Downloads`.
-
-The TV also reacts when the plugin itself starts, so restarting Decky switches the TV on.
 
 ## Trying it without a TV
 
@@ -88,7 +101,16 @@ No Sony Bravia at hand? You can still check that the plugin loads and works:
   via `dbus-monitor`) and holds a short delay lock (`systemd-inhibit`, a few seconds at most) so the TV can
   be turned off before the network goes down. Steam UI events and a clock-jump detector are used as fallbacks.
 - Settings are stored in Decky's plugin settings folder. The pairing key never leaves the backend.
-- Manual install: `pnpm i && pnpm build`, copy `dist/`, `main.py`, `plugin.json`, `package.json` to
-  `~/homebrew/plugins/NetCEC/` and run `sudo systemctl restart plugin_loader`.
+- Build from source and install from another computer (macOS or Linux; Node.js is downloaded automatically
+  if missing, and pnpm is fetched on the fly):
+
+      git clone https://github.com/MSPortnov/NetCEC.git
+      bash NetCEC/deploy.sh 192.168.1.101
+
+  To update: `cd NetCEC && git pull && bash deploy.sh`. The SSH user is `deck` unless you set
+  `DECK_USER=name`; `bash deploy.sh <IP> logs` saves diagnostic logs to `~/Downloads`.
+- Release: raise `version` in `package.json`, commit, then `git tag v1.2.3 && git push origin v1.2.3`.
+  GitHub Actions builds the plugin and attaches `NetCEC.zip` (always this name, plus a `.sha256` file) to a
+  new release; the build fails if the tag does not match `package.json`.
 
 License: GPL-3.0-or-later.
