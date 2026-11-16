@@ -113,4 +113,4 @@ No Sony Bravia at hand? You can still check that the plugin loads and works:
   GitHub Actions builds the plugin and attaches `NetCEC.zip` (always this name, plus a `.sha256` file) to a
   new release; the build fails if the tag does not match `package.json`.
 
-License: GPL-3.0-or-later.
+License: GPL-3.0-or-later. Third-party components and icon credits: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

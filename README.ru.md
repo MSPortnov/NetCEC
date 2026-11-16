@@ -115,4 +115,4 @@ HDMI-CEC не нужен. Это плагин для [Decky Loader](https://deck
   GitHub Actions соберёт плагин и приложит `NetCEC.zip` (имя всегда такое, плюс файл `.sha256`) к новому
   релизу; сборка завершится ошибкой, если тег не совпадает с `package.json`.
 
-Лицензия: GPL-3.0-or-later.
+Лицензия: GPL-3.0-or-later. Сторонние компоненты и авторство иконки: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

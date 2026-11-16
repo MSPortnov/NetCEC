@@ -38,7 +38,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p out/NetCEC
-          cp -r dist main.py plugin.json package.json LICENSE out/NetCEC/
+          cp -r dist main.py plugin.json package.json LICENSE THIRD_PARTY_NOTICES.md out/NetCEC/
           (cd out && zip -qr ../NetCEC.zip NetCEC)
           sha256sum NetCEC.zip > NetCEC.zip.sha256
 
