@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import decky
@@ -561,6 +562,126 @@ def _tv_shutdown(s, typ=None):
     return _leave(s, "off")
 
 
+# ---------- finding the TV on the network (SSDP / UPnP) ----------
+
+SSDP_ADDR = ("239.255.255.250", 1900)
+SSDP_TARGETS = (
+    "urn:schemas-sony-com:service:ScalarWebAPI:1",
+    "urn:schemas-sony-com:service:IRCC:1",
+    "upnp:rootdevice",
+)
+
+
+def _ssdp_search(timeout):
+    """Send SSDP M-SEARCH requests and collect {ip: [description URLs]} of everything that answers.
+    A TV answers with several descriptions (Chromecast, UPnP renderer, ...), so all are kept."""
+    found = {}
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        sock.bind(("", 0))
+        for _ in range(2):  # UDP may lose a packet
+            for st in SSDP_TARGETS:
+                msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+                       'MAN: "ssdp:discover"\r\nMX: 2\r\nST: %s\r\n\r\n' % st).encode()
+                try:
+                    sock.sendto(msg, SSDP_ADDR)
+                except OSError as e:
+                    _log(f"SSDP send failed: {e}")
+        end = time.monotonic() + timeout
+        while not _stop.is_set():
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            sock.settimeout(left)
+            try:
+                data, (ip, _port) = sock.recvfrom(4096)
+            except OSError:  # timeout or socket error: stop listening
+                break
+            headers = {}
+            for line in data.decode("utf-8", "replace").split("\r\n")[1:]:
+                key, _, value = line.partition(":")
+                if value:
+                    headers[key.strip().lower()] = value.strip()
+            location = headers.get("location")
+            if not location or location in found.get(ip, []) or len(found.get(ip, [])) >= 4:
+                continue  # the same device answers several requests with the same description
+            found.setdefault(ip, []).append(location)
+            _log(f"SSDP answer from {ip}: st={headers.get('st', '?')} location={location} "
+                 f"server={headers.get('server', '?')}")
+    return found
+
+
+def _fetch_description(ip, location):
+    """Download the UPnP device description. Only from the device that answered (never follow other hosts)."""
+    u = urllib.parse.urlparse(location)
+    if u.scheme != "http" or u.hostname != ip:
+        _log(f"SSDP: {ip} gave a description URL that is not on its own address ({location}), ignored")
+        return None
+    try:
+        with urllib.request.urlopen(location, timeout=2) as r:
+            return r.read(262144).decode("utf-8", "replace")
+    except Exception as e:
+        _log(f"SSDP: description of {ip} not available: {e}")
+        return None
+
+
+def _unescape(text):
+    for a, b in (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&apos;", "'"), ("&#39;", "'"), ("&amp;", "&")):
+        text = text.replace(a, b)
+    return text
+
+
+def _xml_text(xml_text, name):
+    """First <name>…</name> value; namespace prefixes are ignored. (xml.etree is not available in
+    Decky's bundled Python, so the small UPnP description is read with a regular expression.)"""
+    m = re.search(r"<(?:[\w.-]+:)?%s>\s*([^<]*?)\s*</(?:[\w.-]+:)?%s>" % (name, name), xml_text)
+    return _unescape(m.group(1)) if m else ""
+
+
+def _parse_tv_description(xml_text):
+    """(name, model) if this UPnP/Cast description belongs to a Sony Bravia: Sony as the manufacturer
+    and either the Scalar Web API (UPnP renderer description) or "BRAVIA" in the name (Chromecast
+    description, which is the only one some Google TV models answer with)."""
+    if "sony" not in _xml_text(xml_text, "manufacturer").lower():
+        return None
+    name, model = _xml_text(xml_text, "friendlyName"), _xml_text(xml_text, "modelName")
+    if "ScalarWebAPI" not in xml_text and "bravia" not in (name + " " + model).lower():
+        return None
+    return name, model
+
+
+def _discover(timeout=3.0):
+    """Sony Bravia TVs on the local network: [{"ip", "name", "model"}]."""
+    try:
+        locations = _ssdp_search(timeout)
+    except Exception as e:
+        _log(f"SSDP search failed: {e}")
+        return []
+
+    found = {}
+
+    def check(ip, device_locations):
+        for location in device_locations:
+            xml = _fetch_description(ip, location)
+            info = _parse_tv_description(xml) if xml else None
+            if info:
+                found[ip] = {"ip": ip, "name": info[0], "model": info[1]}
+                return
+            if xml:
+                _log(f"SSDP: {ip} {location}: not a Bravia (manufacturer={_xml_text(xml, 'manufacturer') or '?'}, "
+                     f"model={_xml_text(xml, 'modelName') or '?'}, scalar-api={'ScalarWebAPI' in xml})")
+
+    threads = [threading.Thread(target=check, args=item, daemon=True) for item in list(locations.items())[:16]]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(6)
+    tvs = list(found.values())
+    tvs.sort(key=lambda t: ("bravia" not in (t["name"] + t["model"]).lower(), t["ip"]))
+    _log(f"SSDP: {len(locations)} device(s) answered, {len(tvs)} Sony TV(s) found")
+    return tvs
+
+
 # ---------- sleep / shutdown helpers ----------
 
 SLEEP_POLL = 0.5     # resume detector tick (s)
@@ -570,6 +691,20 @@ LOCK_ARGS = [
     "--why=Turn the TV off before sleep or shutdown", "--mode=delay", "sleep", "infinity",
 ]
 MONITOR_ARGS = ["dbus-monitor", "--system", "type='signal',interface='org.freedesktop.login1.Manager'"]
+
+
+def _kill_group(p):
+    """Kill a child and everything it started: systemd-inhibit runs `sleep infinity` as its own
+    child, and killing only systemd-inhibit would leave that `sleep` running forever."""
+    if not p or p.returncode is not None:
+        return
+    try:
+        os.killpg(p.pid, 9)  # the child leads its own session/group (start_new_session=True)
+    except Exception:
+        try:
+            p.kill()
+        except Exception:
+            pass
 
 
 def _pdeathsig():
@@ -712,6 +847,9 @@ class Plugin:
         }
 
     # ----- TV
+    async def find_tvs(self) -> list:
+        return await asyncio.to_thread(_discover)
+
     async def pair_start(self) -> dict:
         return await asyncio.to_thread(_pair_start, _load())
 
@@ -751,7 +889,7 @@ class Plugin:
             self._lock = await asyncio.create_subprocess_exec(
                 *_exe(LOCK_ARGS), stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, env=_env(),
-                preexec_fn=_pdeathsig)
+                preexec_fn=_pdeathsig, start_new_session=True)
             _log("sleep/shutdown lock taken")
         except Exception as e:
             self._lock = None
@@ -760,11 +898,7 @@ class Plugin:
     async def _release_lock(self):
         p, self._lock = self._lock, None
         if p and p.returncode is None:
-            try:
-                p.kill()
-                await asyncio.wait_for(p.wait(), 2)
-            except Exception:
-                pass
+            _kill_group(p)  # no waiting for the exit: nothing here may block
             _log("sleep/shutdown lock released")
 
     # ----- resume handling
@@ -943,18 +1077,10 @@ class Plugin:
         await self._take_lock()
 
     async def _unload(self):
-        _log("unloading: step 1 (stop flag, cancel tasks)")
+        # Everything here is synchronous on purpose: nothing may keep Decky waiting for the plugin
         _stop.set()
         for t in list(self._tasks) + list(self._bg):
             t.cancel()
-        if self._mon and self._mon.returncode is None:
-            try:
-                self._mon.kill()
-            except Exception:
-                pass
-        _log("unloading: step 2 (release lock)")
-        try:
-            await asyncio.wait_for(self._release_lock(), 3)
-        except Exception as e:
-            _log(f"unloading: lock release problem: {e}")
+        _kill_group(self._mon)
+        await self._release_lock()
         _log("NetCEC unloaded")

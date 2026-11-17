@@ -54,7 +54,9 @@ The script is short, [read it here](install.sh) before you run it.
 
 1. **On the TV:** open Settings > Network > Home network setup > IP control. Set *Authentication* to
    **Normal** and turn on **Remote start**.
-2. **In NetCEC:** type the TV's IP address (you can find it in the TV's network settings).
+2. **In NetCEC:** with the TV turned on, press **Find TV on the network** (the plugin also searches by itself
+   the first time you open it) and pick your TV from the list. If it is not found, type the TV's IP address
+   by hand (you can find it in the TV's network settings).
 3. Press **Show PIN on TV**. A code appears on the TV screen.
 4. Type that code into **PIN shown on TV** and press **Confirm PIN**. The status line shows *Paired*.
 5. Pick the **HDMI port** the box is plugged into, then choose what the TV should do on wake, sleep and shutdown.
@@ -68,6 +70,7 @@ No Sony Bravia at hand? You can still check that the plugin loads and works:
 
 - Open NetCEC from the Quick Access menu. With no IP address the status says *Not configured*; with an
   address typed in, it says *Not paired*.
+- Press **Find TV on the network**: with no Sony Bravia on your network the status says *Nothing found*.
 - Type any IP address and press **Show PIN on TV**: with no TV there, the status reports *No connection*
   (the request failed cleanly, nothing else happens).
 - The **Wake sources (USB)** list shows your USB devices. Switching a device off or on really changes its
@@ -78,6 +81,9 @@ No Sony Bravia at hand? You can still check that the plugin loads and works:
 
 ## If something doesn't work
 
+- **The TV is not found.** Turn the TV on first. The TV and the SteamOS machine must be on the same network
+  (not in separate Wi-Fi/VLAN segments); otherwise enter the IP address by hand. The log in
+  `~/homebrew/logs/NetCEC/` lists every device that answered the search.
 - **The TV does not turn on.** Check that *Remote start* is enabled on the TV, and that the TV keeps its
   network connection in standby (a "network standby" or similar option in the TV settings).
 - **The status says "Pairing lost or expired".** Press *Unpair TV* and pair again (steps 2 to 4).
@@ -91,6 +97,8 @@ No Sony Bravia at hand? You can still check that the plugin loads and works:
 
 - Backend: `main.py` (Python, runs as root: it writes USB wake settings and takes a systemd lock).
   Frontend: `src/index.tsx` (React, built with `pnpm build` into `dist/`).
+- TV discovery: SSDP (UPnP) multicast search; a device is listed only if its description shows a Sony
+  manufacturer and the Scalar Web API, and the description is fetched only from the device that answered.
 - TV control: Sony Bravia IP Control (REST + IRCC), PIN pairing, Wake-on-LAN as a backup wake-up.
 - On start and on resume the plugin sends the wake / input-switch commands right away (2 s timeouts)
   and stops as soon as the TV shows the right port. If the TV is on another input or on its home screen,
@@ -109,6 +117,9 @@ No Sony Bravia at hand? You can still check that the plugin loads and works:
 
   To update: `cd NetCEC && git pull && bash deploy.sh`. The SSH user is `deck` unless you set
   `DECK_USER=name`; `bash deploy.sh <IP> logs` saves diagnostic logs to `~/Downloads`.
+- Decky runs plugins with a trimmed-down Python (parts of the standard library, e.g. `xml.etree`, are missing).
+  `python3 tools/check_imports.py` fails if `main.py` imports a module that is not on the list of modules known
+  to work there; the release build runs it too. Test a new import on a real device before adding it to the list.
 - Release: raise `version` in `package.json`, commit, then `git tag v1.2.3 && git push origin v1.2.3`.
   GitHub Actions builds the plugin and attaches `NetCEC.zip` (always this name, plus a `.sha256` file) to a
   new release; the build fails if the tag does not match `package.json`.

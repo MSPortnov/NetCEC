@@ -29,10 +29,12 @@ type Settings = {
 type Result = { ok: boolean; message: string; skipped?: boolean };
 type UsbDev = { id: string; name: string; wake: boolean; bt: boolean };
 type Info = { root: boolean; monitor: boolean; lock: boolean };
+type TvFound = { ip: string; name: string; model: string };
 
 const getSettings = callable<[], Settings>("get_settings");
 const setSettings = callable<[Partial<Settings>], void>("set_settings");
 const getInfo = callable<[], Info>("get_info");
+const findTvs = callable<[], TvFound[]>("find_tvs");
 const pairStart = callable<[], Result>("pair_start");
 const pairFinish = callable<[string], Result>("pair_finish");
 const tvStatus = callable<[], Result>("tv_status");
@@ -51,7 +53,14 @@ const STR: Record<Lang, Record<string, string>> = {
     loading: "Loading…",
     sec_tv: "TV (Sony Bravia)",
     tv_ip: "TV IP address",
-    hint_tv: "On the TV: IP control > Authentication = Normal, enable Remote start. Then show the PIN and enter it below.",
+    find_tv: "Find TV on the network",
+    searching: "Searching…",
+    found_n: "Found: {n}",
+    found_none: "Nothing found",
+    found_none_hint: "Turn the TV on and check that it is on the same network, or enter its IP address below.",
+    tv_list: "Found TVs",
+    pick_tv: "Choose a TV",
+    hint_tv: "Turn the TV on and press «Find TV» (or enter its IP address). On the TV: IP control > Authentication = Normal, enable Remote start. Then show the PIN and enter it below.",
     pin_show: "Show PIN on TV",
     not_paired: "Not paired",
     pin_label: "PIN shown on TV",
@@ -84,7 +93,14 @@ const STR: Record<Lang, Record<string, string>> = {
     loading: "Загрузка…",
     sec_tv: "ТВ (Sony Bravia)",
     tv_ip: "IP-адрес ТВ",
-    hint_tv: "На ТВ: IP-управление → Аутентификация = Normal, включите «Remote start». Затем покажите PIN и введите его ниже.",
+    find_tv: "Найти ТВ в сети",
+    searching: "Идёт поиск…",
+    found_n: "Найдено: {n}",
+    found_none: "Ничего не найдено",
+    found_none_hint: "Включите ТВ и проверьте, что он в одной сети с приставкой, или введите его IP-адрес ниже.",
+    tv_list: "Найденные ТВ",
+    pick_tv: "Выберите ТВ",
+    hint_tv: "Включите ТВ и нажмите «Найти ТВ» (или введите IP-адрес). На ТВ: IP-управление → Аутентификация = Normal, включите «Remote start». Затем покажите PIN и введите его ниже.",
     pin_show: "Показать PIN на ТВ",
     not_paired: "Не сопряжено",
     pin_label: "PIN с экрана ТВ",
@@ -180,6 +196,9 @@ function Content() {
   const [busy, setBusy] = useState(false);
   const [pin, setPin] = useState("");
   const [confirmUnpair, setConfirmUnpair] = useState(false);
+  const [found, setFound] = useState<TvFound[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [searched, setSearched] = useState(false);
 
   const lang: Lang = s ? resolveLang(s.lang_pref) : detectLang();
   const t = (k: string, n?: number) => tr(lang, k, n);
@@ -193,6 +212,13 @@ function Content() {
     { data: "none", label: t("sl_none") },
     { data: "off", label: t("sl_off") },
   ], [lang]);
+  const tvOptions = useMemo(() => [
+    { data: "", label: t("pick_tv") },
+    ...found.map((f) => ({
+      data: f.ip,
+      label: `${f.name || "TV"}${f.model && f.model !== f.name ? " · " + f.model : ""} (${f.ip})`,
+    })),
+  ], [lang, found]);
   const langOptions = useMemo(() => [
     { data: "auto", label: t("lang_auto") },
     { data: "en", label: "English" },
@@ -202,6 +228,24 @@ function Content() {
   const refresh = () => getSettings().then(setS);
   const refreshStatus = () => tvStatus().then((r) => setStatus(r.message));
   const refreshInfo = () => getInfo().then(setInfo);
+
+  // Looks for Sony TVs on the network; a single TV is filled in automatically if no IP is set yet
+  const discover = async (currentIp: string) => {
+    setSearching(true);
+    try {
+      const list = await findTvs();
+      setFound(list);
+      if (list.length === 1 && !currentIp) {
+        await setSettings({ ip: list[0].ip });
+        setS((cur) => (cur ? { ...cur, ip: list[0].ip } : cur));
+      }
+    } catch (e) {
+      setFound([]);
+    } finally {
+      setSearched(true);
+      setSearching(false);
+    }
+  };
 
   useEffect(() => {
     (async () => {
@@ -215,6 +259,7 @@ function Content() {
       refreshStatus();
       refreshInfo();
       usbList().then(setUsb);
+      if (!st.paired && !st.ip) discover(""); // first start: look for the TV right away
     })();
   }, []);
 
@@ -226,7 +271,7 @@ function Content() {
     // several tries: the dropdown menu closes and Steam moves the focus a moment after our re-render
     const ids = s ? [0, 150, 400, 900].map((ms) => window.setTimeout(restoreFocus, ms)) : [];
     return () => ids.forEach((id) => window.clearTimeout(id));
-  }, [s, info, usb, busy, status]);
+  }, [s, info, usb, busy, status, found, searching]);
 
   if (!s) return <PanelSection title={TITLE}>{t("loading")}</PanelSection>;
 
@@ -280,6 +325,35 @@ function Content() {
         ) : (
           <>
             <Row id="top">
+              <ButtonItem
+                layout="below"
+                disabled={busy || searching}
+                description={
+                  searching ? t("searching") : searched ? (found.length ? t("found_n", found.length) : t("found_none")) : undefined
+                }
+                onClick={() => discover(s.ip)}
+              >
+                {t("find_tv")}
+              </ButtonItem>
+            </Row>
+            {searched && !searching && found.length === 0 && (
+              <PanelSectionRow>
+                <div style={{ fontSize: 12, opacity: 0.7 }}>{t("found_none_hint")}</div>
+              </PanelSectionRow>
+            )}
+            {found.length > 0 && (
+              <Row id="tv-list">
+                <DropdownItem
+                  label={t("tv_list")}
+                  rgOptions={tvOptions}
+                  selectedOption={found.some((f) => f.ip === s.ip) ? s.ip : ""}
+                  onChange={(o) => {
+                    if (o.data) update({ ip: o.data as string });
+                  }}
+                />
+              </Row>
+            )}
+            <Row id="ip">
               <TextField
                 label={t("tv_ip")}
                 value={s.ip}

@@ -15,6 +15,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check that main.py only imports modules that work in Decky's Python
+        run: python3 tools/check_imports.py
+
       - name: Check that the tag matches package.json
         run: |
           V="$(jq -r .version package.json)"
