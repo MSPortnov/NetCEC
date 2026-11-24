@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
-import { addEventListener, callable, definePlugin, removeEventListener, toaster } from "@decky/api";
+import { callable, definePlugin } from "@decky/api";
 import {
   ButtonItem,
+  Dropdown,
   DropdownItem,
   PanelSection,
   PanelSectionRow,
@@ -18,10 +19,10 @@ type Settings = {
   paired: boolean;
   hdmi_port: number;
   wake_tv: boolean;
-  switch_input: boolean;
+  driver: string;
+  journal: boolean;
   suspend_action: string;
   shutdown_action: string;
-  off_only_if_active: boolean;
   wake_rules: Record<string, boolean>;
   lang: string;
   lang_pref: string;
@@ -29,12 +30,14 @@ type Settings = {
 type Result = { ok: boolean; message: string; skipped?: boolean };
 type UsbDev = { id: string; name: string; wake: boolean; bt: boolean };
 type Info = { root: boolean; monitor: boolean; lock: boolean };
-type TvFound = { ip: string; name: string; model: string };
+type TvFound = { ip: string; name: string; model: string; kind: string };
+type EventItem = { t: number; kind: string; ok: boolean; text: string };
 
 const getSettings = callable<[], Settings>("get_settings");
 const setSettings = callable<[Partial<Settings>], void>("set_settings");
 const getInfo = callable<[], Info>("get_info");
 const findTvs = callable<[], TvFound[]>("find_tvs");
+const getEvents = callable<[], EventItem[]>("get_events");
 const pairStart = callable<[], Result>("pair_start");
 const pairFinish = callable<[string], Result>("pair_finish");
 const tvStatus = callable<[], Result>("tv_status");
@@ -51,7 +54,7 @@ const TITLE = "NetCEC";
 const STR: Record<Lang, Record<string, string>> = {
   en: {
     loading: "Loading…",
-    sec_tv: "TV (Sony Bravia)",
+    sec_tv: "TV",
     tv_ip: "TV IP address",
     find_tv: "Find TV on the network",
     searching: "Searching…",
@@ -61,27 +64,39 @@ const STR: Record<Lang, Record<string, string>> = {
     tv_list: "Found TVs",
     pick_tv: "Choose a TV",
     hint_tv: "Turn the TV on and press «Find TV» (or enter its IP address). On the TV: IP control > Authentication = Normal, enable Remote start. Then show the PIN and enter it below.",
+    hint_tv_adb: "On the TV: Developer options > turn on Network debugging (USB debugging). Then press Connect: the TV asks to allow debugging, choose \u201cAlways allow\u201d.",
+    adb_connect: "Connect",
+    kind_adb: "Android TV",
     pin_show: "Show PIN on TV",
     not_paired: "Not paired",
     pin_label: "PIN shown on TV",
     pin_confirm: "Confirm PIN",
     hdmi_port: "HDMI port of this device",
-    sec_todo: "TV: what to do",
-    wake_tv: "Wake TV",
-    switch_input: "Switch HDMI input",
-    on_sleep: "When going to sleep",
-    sl_none: "Do nothing",
-    sl_off: "Turn TV off",
-    sl_home: "Android TV home screen",
+    sec_wake: "On start and wake-up",
+    sec_sleep: "When going to sleep",
+    sec_shutdown: "When shutting down",
+    sec_events: "Journal",
+    journal: "Action journal",
+    ev_none: "Nothing has happened yet.",
+    ev_wake: "Wake-up",
+    ev_sleep: "Sleep",
+    ev_shutdown: "Shutdown",
+    need_pairing: "Pair the TV first (section above): until then the plugin does nothing.",
+    opt_home: "To home screen",
+    opt_off: "Turn TV off",
+    hint_wake_on: "When SteamOS starts or wakes up, the TV is turned on (if it was off) and switched to HDMI {n} (if it is not on it yet).",
+    hint_wake_off: "When SteamOS starts or wakes up, the TV is not touched.",
+    hint_sl_home: "When SteamOS goes to sleep, the TV goes to its Android TV home screen if it is on HDMI {n} at that moment.",
+    hint_sl_off: "When SteamOS goes to sleep, the TV is turned off if it is on HDMI {n} at that moment.",
+    hint_sd_home: "When SteamOS shuts down, the TV goes to its Android TV home screen if it is on HDMI {n} at that moment.",
+    hint_sd_off: "When SteamOS shuts down, the TV is turned off if it is on HDMI {n} at that moment.",
+    wake_tv: "Wake TV and switch input",
     unpair: "Unpair TV",
     unpair_confirm: "Press again to unpair",
-    on_shutdown: "When shutting down",
-    only_mine: "Only if TV is on my HDMI port",
-    only_mine_d: "Don't switch off a TV someone is watching on another input",
     hook_on: "Sleep hook (systemd): active",
     hook_off: "Sleep hook (systemd): not running",
     lock_held: "lock held",
-    sec_usb: "Wake sources (USB)",
+    sec_usb: "Wake sources",
     no_root: "Backend is not running as root, changes will fail.",
     no_usb: "No USB devices with wake support found.",
     bt_adapter: " · Bluetooth adapter",
@@ -91,7 +106,7 @@ const STR: Record<Lang, Record<string, string>> = {
   },
   ru: {
     loading: "Загрузка…",
-    sec_tv: "ТВ (Sony Bravia)",
+    sec_tv: "Телевизор",
     tv_ip: "IP-адрес ТВ",
     find_tv: "Найти ТВ в сети",
     searching: "Идёт поиск…",
@@ -101,27 +116,39 @@ const STR: Record<Lang, Record<string, string>> = {
     tv_list: "Найденные ТВ",
     pick_tv: "Выберите ТВ",
     hint_tv: "Включите ТВ и нажмите «Найти ТВ» (или введите IP-адрес). На ТВ: IP-управление → Аутентификация = Normal, включите «Remote start». Затем покажите PIN и введите его ниже.",
+    hint_tv_adb: "На ТВ: «Для разработчиков» → включите «Отладка по сети» (отладка по USB). Затем нажмите «Подключить»: ТВ спросит разрешение на отладку, выберите «Всегда разрешать».",
+    adb_connect: "Подключить",
+    kind_adb: "Android TV",
     pin_show: "Показать PIN на ТВ",
     not_paired: "Не сопряжено",
     pin_label: "PIN с экрана ТВ",
     pin_confirm: "Подтвердить PIN",
     hdmi_port: "HDMI-порт этого устройства",
-    sec_todo: "ТВ: что делать",
-    wake_tv: "Включать ТВ",
-    switch_input: "Переключать HDMI-вход",
-    on_sleep: "При уходе в сон",
-    sl_none: "Ничего не делать",
-    sl_off: "Выключать ТВ",
-    sl_home: "Домашний экран Android TV",
+    sec_wake: "При включении и пробуждении",
+    sec_sleep: "При уходе в сон",
+    sec_shutdown: "При выключении",
+    sec_events: "Журнал",
+    journal: "Журнал действий",
+    ev_none: "Пока ничего не происходило.",
+    ev_wake: "Пробуждение",
+    ev_sleep: "Сон",
+    ev_shutdown: "Выключение",
+    need_pairing: "Сначала выполните сопряжение с ТВ (раздел выше): до этого плагин ничего не делает.",
+    opt_home: "На домашний экран",
+    opt_off: "Выключить ТВ",
+    hint_wake_on: "При включении или пробуждении SteamOS включается ТВ (если он был выключен) и переключается на HDMI {n} (если он ещё не на нём).",
+    hint_wake_off: "При включении и пробуждении SteamOS не трогаем ТВ.",
+    hint_sl_home: "Когда SteamOS уходит в сон, ТВ переходит на домашний экран Android TV, если он сейчас на HDMI {n}.",
+    hint_sl_off: "Когда SteamOS уходит в сон, ТВ выключается, если он сейчас на HDMI {n}.",
+    hint_sd_home: "Когда SteamOS выключается, ТВ переходит на домашний экран Android TV, если он сейчас на HDMI {n}.",
+    hint_sd_off: "Когда SteamOS выключается, ТВ выключается, если он сейчас на HDMI {n}.",
+    wake_tv: "Включать ТВ и переключать вход",
     unpair: "Разорвать пару с ТВ",
     unpair_confirm: "Нажмите ещё раз для сброса",
-    on_shutdown: "При выключении ПК",
-    only_mine: "Только если ТВ на моём HDMI-порту",
-    only_mine_d: "Не выключать ТВ, который кто-то смотрит на другом входе",
     hook_on: "Перехват сна (systemd): активен",
     hook_off: "Перехват сна (systemd): не работает",
     lock_held: "блокировка удерживается",
-    sec_usb: "Источники пробуждения (USB)",
+    sec_usb: "Источники пробуждения",
     no_root: "Бэкенд запущен не от root, изменения не сработают.",
     no_usb: "USB-устройства с поддержкой пробуждения не найдены.",
     bt_adapter: " · Bluetooth-адаптер",
@@ -144,7 +171,7 @@ const resolveLang = (pref: string): Lang =>
 
 const tr = (lang: Lang, key: string, n?: number): string => {
   const v = STR[lang][key] ?? STR.en[key] ?? key;
-  return n === undefined ? v : v.replace("{n}", String(n));
+  return n === undefined ? v : v.split("{n}").join(String(n));
 };
 
 // ---------- UI ----------
@@ -175,6 +202,22 @@ function Row({ id, children }: { id: string; children: ReactNode }) {
   );
 }
 
+// A hint is a row of its own under the control (full width), not a description beside it.
+const fmtTime = (epoch: number) => {
+  const d = new Date(epoch * 1000);
+  const hm = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  if (d.toDateString() === new Date().toDateString()) return hm;
+  return String(d.getDate()).padStart(2, "0") + "." + String(d.getMonth() + 1).padStart(2, "0") + " " + hm;
+};
+
+function Hint({ text }: { text: string }) {
+  return (
+    <PanelSectionRow>
+      <div style={{ fontSize: 12, lineHeight: 1.35, opacity: 0.7 }}>{text}</div>
+    </PanelSectionRow>
+  );
+}
+
 const restoreFocus = () => {
   if (Date.now() > restoreUntil) return;
   const row = lastFocusId ? rowEls[lastFocusId] : null;
@@ -191,6 +234,8 @@ const PORTS = [1, 2, 3, 4].map((n) => ({ data: n, label: `HDMI ${n}` }));
 function Content() {
   const [s, setS] = useState<Settings | null>(null);
   const [status, setStatus] = useState("…");
+  const [note, setNote] = useState("");  // why the last action of the user failed
+  const [events, setEvents] = useState<EventItem[]>([]);
   const [usb, setUsb] = useState<UsbDev[]>([]);
   const [info, setInfo] = useState<Info>({ root: true, monitor: false, lock: false });
   const [busy, setBusy] = useState(false);
@@ -203,20 +248,15 @@ function Content() {
   const lang: Lang = s ? resolveLang(s.lang_pref) : detectLang();
   const t = (k: string, n?: number) => tr(lang, k, n);
 
-  const suspendOptions = useMemo(() => [
-    { data: "none", label: t("sl_none") },
-    { data: "off", label: t("sl_off") },
-    { data: "home", label: t("sl_home") },
-  ], [lang]);
-  const shutdownOptions = useMemo(() => [
-    { data: "none", label: t("sl_none") },
-    { data: "off", label: t("sl_off") },
+  const leaveOptions = useMemo(() => [
+    { data: "home", label: t("opt_home") },
+    { data: "off", label: t("opt_off") },
   ], [lang]);
   const tvOptions = useMemo(() => [
     { data: "", label: t("pick_tv") },
     ...found.map((f) => ({
       data: f.ip,
-      label: `${f.name || "TV"}${f.model && f.model !== f.name ? " · " + f.model : ""} (${f.ip})`,
+      label: `${f.name || "TV"}${f.model && f.model !== f.name ? " · " + f.model : ""}${f.kind === "adb" ? " · " + t("kind_adb") : ""} (${f.ip})`,
     })),
   ], [lang, found]);
   const langOptions = useMemo(() => [
@@ -227,6 +267,10 @@ function Content() {
 
   const refresh = () => getSettings().then(setS);
   const refreshStatus = () => tvStatus().then((r) => setStatus(r.message));
+  const refreshEvents = () =>
+    getEvents()
+      .then((e) => setEvents((old) => (JSON.stringify(old) === JSON.stringify(e) ? old : e)))
+      .catch(() => {});
   const refreshInfo = () => getInfo().then(setInfo);
 
   // Looks for Sony TVs on the network; a single TV is filled in automatically if no IP is set yet
@@ -268,6 +312,17 @@ function Content() {
   }, []);
 
   useEffect(() => {
+    // the journal of recent actions: look again every few seconds while the panel is open and the journal is on
+    if (!s?.journal) {
+      setEvents([]);
+      return undefined;
+    }
+    refreshEvents();
+    const id = window.setInterval(refreshEvents, 3000);
+    return () => window.clearInterval(id);
+  }, [s?.journal]);
+
+  useEffect(() => {
     // several tries: the dropdown menu closes and Steam moves the focus a moment after our re-render
     const ids = s ? [0, 150, 400, 900].map((ms) => window.setTimeout(restoreFocus, ms)) : [];
     return () => ids.forEach((id) => window.clearTimeout(id));
@@ -281,12 +336,13 @@ function Content() {
     setSettings(patch).then(refreshInfo);
   };
 
-  // Notifications only when something goes wrong
+  // The result of an action (pairing, a check) is shown in the panel; there are no pop-up notifications
   const run = async (fn: () => Promise<Result>) => {
     setBusy(true);
     try {
       const r = await fn();
-      if (!r.ok) toaster.toast({ title: TITLE, body: r.message });
+      setNote(r.ok ? "" : r.message);
+      refreshEvents();
     } finally {
       restoreUntil = Date.now() + 2000;
       setBusy(false);
@@ -303,6 +359,11 @@ function Content() {
         <PanelSectionRow>
           <div style={{ fontSize: 13 }}>{status}</div>
         </PanelSectionRow>
+        {note && (
+          <PanelSectionRow>
+            <div style={{ fontSize: 12, lineHeight: 1.35, color: "#e8b04a" }}>{note}</div>
+          </PanelSectionRow>
+        )}
         {paired ? (
           <Row id="top">
             <ButtonItem
@@ -348,7 +409,8 @@ function Content() {
                   rgOptions={tvOptions}
                   selectedOption={found.some((f) => f.ip === s.ip) ? s.ip : ""}
                   onChange={(o) => {
-                    if (o.data) update({ ip: o.data as string });
+                    const tv = found.find((f) => f.ip === o.data);
+                    if (tv) update({ ip: tv.ip, driver: tv.kind === "adb" ? "adb" : "sony" });
                   }}
                 />
               </Row>
@@ -357,11 +419,11 @@ function Content() {
               <TextField
                 label={t("tv_ip")}
                 value={s.ip}
-                onChange={(e) => update({ ip: e.target.value.trim() })}
+                onChange={(e) => update({ ip: e.target.value.trim(), driver: "sony" })}
               />
             </Row>
             <PanelSectionRow>
-              <div style={{ fontSize: 12, opacity: 0.7 }}>{t("hint_tv")}</div>
+              <div style={{ fontSize: 12, opacity: 0.7 }}>{t(s.driver === "adb" ? "hint_tv_adb" : "hint_tv")}</div>
             </PanelSectionRow>
             <Row id="pin-show">
               <ButtonItem
@@ -370,31 +432,35 @@ function Content() {
                 description={t("not_paired")}
                 onClick={() => run(() => pairStart())}
               >
-                {t("pin_show")}
+                {t(s.driver === "adb" ? "adb_connect" : "pin_show")}
               </ButtonItem>
             </Row>
-            <Row id="pin-input">
-              <TextField
-                label={t("pin_label")}
-                value={pin}
-                onChange={(e) => setPin(e.target.value.trim())}
-              />
-            </Row>
-            <Row id="pin-confirm">
-              <ButtonItem
-                layout="below"
-                disabled={busy || !pin}
-                onClick={() =>
-                  run(async () => {
-                    const r = await pairFinish(pin);
-                    if (r.ok) setPin("");
-                    return r;
-                  })
-                }
-              >
-                {t("pin_confirm")}
-              </ButtonItem>
-            </Row>
+            {s.driver !== "adb" && (
+              <>
+                <Row id="pin-input">
+                  <TextField
+                    label={t("pin_label")}
+                    value={pin}
+                    onChange={(e) => setPin(e.target.value.trim())}
+                  />
+                </Row>
+                <Row id="pin-confirm">
+                  <ButtonItem
+                    layout="below"
+                    disabled={busy || !pin}
+                    onClick={() =>
+                      run(async () => {
+                        const r = await pairFinish(pin);
+                        if (r.ok) setPin("");
+                        return r;
+                      })
+                    }
+                  >
+                    {t("pin_confirm")}
+                  </ButtonItem>
+                </Row>
+              </>
+            )}
           </>
         )}
         <Row id="hdmi-port">
@@ -407,46 +473,78 @@ function Content() {
         </Row>
       </PanelSection>
 
-      <PanelSection title={t("sec_todo")}>
-        <Row id="wake-tv">
-          <ToggleField label={t("wake_tv")} checked={s.wake_tv} onChange={(v) => update({ wake_tv: v })} />
+      {!s.paired && (
+        <PanelSection>
+          <Hint text={t("need_pairing")} />
+        </PanelSection>
+      )}
+
+      <div style={{ opacity: s.paired ? 1 : 0.4 }}>
+        <PanelSection title={t("sec_wake")}>
+          <Row id="wake-tv">
+            <ToggleField
+              label={t("wake_tv")}
+              disabled={!s.paired}
+              checked={s.wake_tv}
+              onChange={(v) => update({ wake_tv: v })}
+            />
+          </Row>
+          <Hint text={tr(lang, s.wake_tv ? "hint_wake_on" : "hint_wake_off", s.hdmi_port)} />
+        </PanelSection>
+
+        <PanelSection title={t("sec_sleep")}>
+          <Row id="on-sleep">
+            <Dropdown
+              rgOptions={leaveOptions}
+              disabled={!s.paired}
+              selectedOption={s.suspend_action}
+              onChange={(o) => update({ suspend_action: o.data as string })}
+            />
+          </Row>
+          <Hint text={tr(lang, "hint_sl_" + s.suspend_action, s.hdmi_port)} />
+          <PanelSectionRow>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>
+              {(info.monitor ? t("hook_on") : t("hook_off")) + (info.lock ? " · " + t("lock_held") : "")}
+            </div>
+          </PanelSectionRow>
+        </PanelSection>
+
+        <PanelSection title={t("sec_shutdown")}>
+          <Row id="on-shutdown">
+            <Dropdown
+              rgOptions={leaveOptions}
+              disabled={!s.paired}
+              selectedOption={s.shutdown_action}
+              onChange={(o) => update({ shutdown_action: o.data as string })}
+            />
+          </Row>
+          <Hint text={tr(lang, "hint_sd_" + s.shutdown_action, s.hdmi_port)} />
+        </PanelSection>
+      </div>
+
+      <PanelSection title={t("sec_events")}>
+        <Row id="journal">
+          <ToggleField label={t("journal")} checked={s.journal} onChange={(v) => update({ journal: v })} />
         </Row>
-        <Row id="switch-input">
-          <ToggleField
-            label={t("switch_input")}
-            checked={s.switch_input}
-            onChange={(v) => update({ switch_input: v })}
-          />
-        </Row>
-        <Row id="on-sleep">
-          <DropdownItem
-            label={t("on_sleep")}
-            rgOptions={suspendOptions}
-            selectedOption={s.suspend_action}
-            onChange={(o) => update({ suspend_action: o.data as string })}
-          />
-        </Row>
-        <Row id="on-shutdown">
-          <DropdownItem
-            label={t("on_shutdown")}
-            rgOptions={shutdownOptions}
-            selectedOption={s.shutdown_action}
-            onChange={(o) => update({ shutdown_action: o.data as string })}
-          />
-        </Row>
-        <Row id="only-mine">
-          <ToggleField
-            label={t("only_mine")}
-            description={t("only_mine_d")}
-            checked={s.off_only_if_active}
-            onChange={(v) => update({ off_only_if_active: v })}
-          />
-        </Row>
-        <PanelSectionRow>
-          <div style={{ fontSize: 12, opacity: 0.7 }}>
-            {(info.monitor ? t("hook_on") : t("hook_off")) + (info.lock ? " · " + t("lock_held") : "")}
-          </div>
-        </PanelSectionRow>
+        {s.journal && (
+          <PanelSectionRow>
+            <div style={{ fontSize: 12, lineHeight: 1.4 }}>
+              {events.length === 0 && <div style={{ opacity: 0.7 }}>{t("ev_none")}</div>}
+              {events.map((e, i) => (
+                <div key={i} style={{ marginBottom: 4 }}>
+                  <span
+                    style={{
+                      display: "inline-block", width: 8, height: 8, borderRadius: 4, marginRight: 6,
+                      background: e.ok ? "#4caf50" : "#e05050",
+                    }}
+                  />
+                  <span style={{ opacity: 0.7 }}>{fmtTime(e.t)} </span>
+                  <b>{t("ev_" + e.kind)}</b>: {e.text}
+                </div>
+              ))}
+            </div>
+          </PanelSectionRow>
+        )}
       </PanelSection>
 
       <PanelSection title={t("sec_usb")}>
@@ -488,11 +586,6 @@ function Content() {
   );
 }
 
-// Notifications only for problems, never for successful actions
-const notify = (r: Result) => {
-  if (!r.ok) toaster.toast({ title: TITLE, body: r.message });
-};
-
 export default definePlugin(() => {
   // keep the backend's message language in sync with the Steam UI language
   getSettings()
@@ -522,13 +615,8 @@ export default definePlugin(() => {
   hook(sc?.User, "RegisterForPrepareForSystemSuspendProgress", () => {
     onSuspend("PrepareForSystemSuspendProgress");
   });
-  hook(sc?.System, "RegisterForOnResumeFromSuspend", async () => {
-    const r = await onResume();
-    if (!r.skipped) notify(r);
-  });
-  // results of actions the backend triggered itself (resume)
-  const resumeListener = addEventListener<[Result]>("resume_result", (r) => {
-    notify(r);
+  hook(sc?.System, "RegisterForOnResumeFromSuspend", () => {
+    onResume();
   });
 
   return {
@@ -538,7 +626,6 @@ export default definePlugin(() => {
     icon: <FaTv />,
     onDismount() {
       regs.forEach((r) => r?.unregister?.());
-      removeEventListener("resume_result", resumeListener);
     },
   };
 });

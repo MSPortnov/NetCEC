@@ -18,6 +18,9 @@ jobs:
       - name: Check that main.py only imports modules that work in Decky's Python
         run: python3 tools/check_imports.py
 
+      - name: Tests
+        run: python3 -m unittest discover -s tests
+
       - name: Check that the tag matches package.json
         run: |
           V="$(jq -r .version package.json)"
@@ -41,7 +44,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p out/NetCEC
-          cp -r dist main.py plugin.json package.json LICENSE THIRD_PARTY_NOTICES.md out/NetCEC/
+          cp -r dist main.py py_modules plugin.json package.json LICENSE THIRD_PARTY_NOTICES.md out/NetCEC/
           (cd out && zip -qr ../NetCEC.zip NetCEC)
           sha256sum NetCEC.zip > NetCEC.zip.sha256
 

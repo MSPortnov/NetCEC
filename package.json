@@ -1,6 +1,6 @@
 {
   "name": "netcec",
-  "version": "1.3.3",
+  "version": "1.5.1",
   "description": "NetCEC: Sony Bravia control and USB wake sources for Decky Loader",
   "repository": {
     "type": "git",

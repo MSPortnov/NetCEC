@@ -2,25 +2,34 @@
 
 **English** · [Русский](README.ru.md)
 
-**NetCEC turns your Sony Bravia TV on and off together with your SteamOS box.**
+**NetCEC turns your TV on and off together with your SteamOS box** (Sony Bravia, or an Android TV such as TCL).
 When the box wakes up, the TV switches on and jumps to the right HDMI input. When the box goes to sleep or
 shuts down, the TV turns off (or goes back to its home screen). Everything works over your home network,
 so you don't need HDMI-CEC. It is a plugin for [Decky Loader](https://decky.xyz/) and is used in Game Mode.
 
 ## What it can do
 
-- **Wake the TV and switch to your HDMI input** when the box starts or wakes up from sleep.
-- **Turn the TV off, or send it to the Android TV home screen,** when the box goes to sleep.
-- **Turn the TV off when the box shuts down.** A reboot never turns the TV off.
-- **Leave the TV alone if someone is watching something else.** With "Only if TV is on my HDMI port"
-  turned on, the TV is only switched off when it is showing your box.
+- **On wake-up:** turns the TV on and switches it to your HDMI input when the box starts or wakes up from sleep.
+- **When going to sleep** and **when shutting down:** you choose one of two actions: send the TV to its Android TV
+  home screen (so it does not show "No signal") or turn it off. A reboot never touches the TV.
+- **Leaves the TV alone if someone is watching something else:** both actions only run if the TV is on your
+  HDMI port at that moment.
 - **Choose which USB devices can wake the box,** for example the Bluetooth adapter yes, the mouse no.
 - **English and Russian** interface (follows the Steam language, or pick it manually).
+
+- **Can show what it did:** switch on "Action journal" and the panel lists the last actions (time, what happened,
+  how long the switch took). It is off by default, and while it is off nothing is recorded.
+- **Follows the TV if its address changes** (the router gave it a new one): it is found again by its MAC address.
+  Still, it is best to reserve a fixed address for the TV in the router.
+- **No pop-up notifications:** you see the result on the TV and in the list.
 
 ## What you need
 
 - A SteamOS device with Decky Loader installed.
-- A Sony Bravia TV on Android TV, on the same network as the box.
+- A TV on the same network as the box, one of:
+  - **Sony Bravia** (Android TV): controlled through Sony's IP control with a PIN. Tested.
+  - **Another Android TV / Google TV** (TCL and others): controlled over ADB (network debugging). The TCL is
+    supported with its own HDMI input table; other brands use the standard HDMI keys, which not every TV honors.
 
 ## Installing and updating
 
@@ -52,17 +61,35 @@ The script is short, [read it here](install.sh) before you run it.
 
 ## Setting up
 
-1. **On the TV:** open Settings > Network > Home network setup > IP control. Set *Authentication* to
-   **Normal** and turn on **Remote start**.
+1. **On the TV.**
+   - *Sony Bravia:* open Settings > Network > Home network setup > IP control. Set *Authentication* to
+     **Normal** and turn on **Remote start**.
+   - *Android TV (TCL and others):* turn on Developer options, then **Network debugging** (USB debugging).
 2. **In NetCEC:** with the TV turned on, press **Find TV on the network** (the plugin also searches by itself
    the first time you open it) and pick your TV from the list. If it is not found, type the TV's IP address
    by hand (you can find it in the TV's network settings).
-3. Press **Show PIN on TV**. A code appears on the TV screen.
-4. Type that code into **PIN shown on TV** and press **Confirm PIN**. The status line shows *Paired*.
-5. Pick the **HDMI port** the box is plugged into, then choose what the TV should do on wake, sleep and shutdown.
+3. - *Sony:* press **Show PIN on TV**. A code appears on the TV screen. Type it into **PIN shown on TV** and
+     press **Confirm PIN**.
+   - *Android TV:* press **Connect**. The TV asks "Allow USB debugging?": choose **Always allow** (the plugin
+     waits for 25 seconds; press Connect again if you were late).
+4. The status line shows *Paired*. (The list of found TVs shows "Android TV" next to the TVs that are connected
+   over ADB; for Sony nothing changes.)
+5. Pick the **HDMI port** the box is plugged into. Then, in the three sections *On wake-up*, *When going to sleep*
+   and *When shutting down*, choose what the TV should do. Under every choice the plugin shows in one sentence
+   what it will do.
 
 The pairing renews itself every time it is used. If it gets lost (for example you removed the device on the
 TV), the status will ask you to pair again.
+
+### Android TV: what to know
+
+- Sony stays on its own, more precise control (it reports power and the shown input and needs no developer mode),
+  so a Sony TV that also has ADB is still controlled through Sony's IP control.
+- The Android TV is woken with the power-on key, switched to the HDMI port by opening the TV's own input link,
+  and sent to the home screen or to sleep with the Home / Sleep keys. A TV in standby must keep its network on.
+- The plugin cannot ask an Android TV for the shown input as precisely as Sony. When it cannot tell which input
+  is shown, it does not touch the TV on sleep or shutdown (the log line `adb look:` shows what the TV said).
+  Wake-up always switches the input.
 
 ## Trying it without a TV
 
@@ -73,9 +100,11 @@ No Sony Bravia at hand? You can still check that the plugin loads and works:
 - Press **Find TV on the network**: with no Sony Bravia on your network the status says *Nothing found*.
 - Type any IP address and press **Show PIN on TV**: with no TV there, the status reports *No connection*
   (the request failed cleanly, nothing else happens).
-- The **Wake sources (USB)** list shows your USB devices. Switching a device off or on really changes its
+- The **Wake sources** list shows your USB devices. Switching a device off or on really changes its
   wake setting, and it is restored after a restart.
-- Set **When going to sleep** to any action: the "Sleep hook" line should say *active* and *lock held*.
+- In **When going to sleep** the "Sleep hook" line should say *active*, and *lock held* once a TV is paired.
+- With "Action journal" switched on, the list under it shows every wake-up, sleep and shutdown with the time and the
+  result.
 - Change the **Language** and check that the interface and messages follow.
 - The log in `~/homebrew/logs/NetCEC/` shows what the plugin did at start, sleep and resume.
 
@@ -87,10 +116,16 @@ No Sony Bravia at hand? You can still check that the plugin loads and works:
 - **The TV does not turn on.** Check that *Remote start* is enabled on the TV, and that the TV keeps its
   network connection in standby (a "network standby" or similar option in the TV settings).
 - **The status says "Pairing lost or expired".** Press *Unpair TV* and pair again (steps 2 to 4).
-- **The TV does not turn off on sleep.** Make sure "When going to sleep" is not set to "Do nothing", and that
-  the "Sleep hook" line in the plugin says *active*.
-- **The TV stays on when the box sleeps.** If "Only if TV is on my HDMI port" is on, the TV is left alone
-  when it shows a different input.
+- **The TV does not react after the router restarted.** The plugin looks for the TV again by its MAC address when
+  it does not answer for a few seconds, and says so in the action journal (if it is switched on). If it still fails, reserve a fixed
+  address for the TV in the router and type that address in the plugin.
+- **The settings are dimmed.** Wake-up, sleep and shutdown only work for a paired TV: pair it first (steps 2 to 4).
+- **Nothing happens on sleep or shutdown.** The actions only run for a paired TV (the status says *Paired*), and the
+  "Sleep hook" line in the plugin should say *active*.
+- **The TV stays on when the box sleeps or shuts down.** The TV is only touched when it shows your HDMI port; it is
+  left alone if it shows a different input, the home screen, or did not answer in time. The log line
+  `leave: input check ...` says what the TV answered. Check that the HDMI port in the plugin is the one the box
+  is plugged into.
 - **Logs:** `~/homebrew/logs/NetCEC/`.
 
 ## For developers
@@ -100,15 +135,29 @@ No Sony Bravia at hand? You can still check that the plugin loads and works:
 - TV discovery: SSDP (UPnP) multicast search; a device is listed only if its description shows a Sony
   manufacturer and the Scalar Web API, and the description is fetched only from the device that answered.
 - TV control: Sony Bravia IP Control (REST + IRCC), PIN pairing, Wake-on-LAN as a backup wake-up.
-- On start and on resume the plugin sends the wake / input-switch commands right away (2 s timeouts)
-  and stops as soon as the TV shows the right port. If the TV is on another input or on its home screen,
-  the remote's Home key is sent first (it ends a running screensaver) and then the input switch, with a
-  0.4 s pause between them. The input switch is sent at most 3 times; a sleeping TV is woken again
-  every ~3 s for up to 45 s.
+- On start and on resume the plugin asks the TV which input it shows and sends nothing if it is already on
+  the right port. Otherwise it presses the remote's Back key (it ends a running screensaver), then sends the input
+  switch once (0.1 s apart), and asks the TV every 0.4 s until it reports the port: after a resume the TV
+  needs a few seconds for that, and a repeated command only restarts its switching. The command is sent
+  once more only if the TV has not confirmed after 8 s; after that the result is "sent, not confirmed".
+  A TV that does not answer is woken (power on + Wake-on-LAN) every ~3 s for up to 45 s. Every switch writes
+  one log line with the time of each step and what the TV said.
 - Sleep and shutdown: the backend follows systemd-logind (`PrepareForSleep` / `PrepareForShutdown`
   via `dbus-monitor`) and holds a short delay lock (`systemd-inhibit`, a few seconds at most) so the TV can
   be turned off before the network goes down. Steam UI events and a clock-jump detector are used as fallbacks.
-- Settings are stored in Decky's plugin settings folder. The pairing key never leaves the backend.
+  Each real wake-up is handled exactly once: the kernel counts finished suspend attempts
+  (`/sys/power/suspend_stats/success` + `fail`), and a source reporting the same count again is a duplicate
+  (a 20 s timer is the fallback if the counter is missing; the log says which one is used).
+- The action journal is `events.json` next to the settings (20 entries, the panel shows 5). It is off by default;
+  while it is off nothing is written, and switching it off deletes the file. (The technical log in Decky's
+  folder is always written: it is what the diagnostics are taken from.) If the TV
+  does not answer for 6 s and its MAC address is known, one network search looks for a Sony TV with that MAC and
+  updates the saved address.
+- Settings are stored in Decky's plugin settings folder (`settings.json`, readable by the owner only). The file is
+  written atomically and the last good version is kept as `settings.json.bak`; a damaged file is moved to
+  `settings.json.corrupt` and the backup is used, so the pairing is not lost. The pairing key never leaves the
+  backend, and every value coming from the UI is validated.
+- Tests (no TV and no network needed): `python3 -m unittest discover -s tests`. They run in CI on every push.
 - Build from source and install from another computer (macOS or Linux; Node.js is downloaded automatically
   if missing, and pnpm is fetched on the fly):
 
@@ -120,6 +169,10 @@ No Sony Bravia at hand? You can still check that the plugin loads and works:
 - Decky runs plugins with a trimmed-down Python (parts of the standard library, e.g. `xml.etree`, are missing).
   `python3 tools/check_imports.py` fails if `main.py` imports a module that is not on the list of modules known
   to work there; the release build runs it too. Test a new import on a real device before adding it to the list.
+- Android TV: `py_modules/netcec_adb.py` is a small ADB client of our own (RSA key made on first use and kept
+  in the settings folder, 0600; the public key is offered to the TV and the user accepts it once). It needs no
+  third-party library, which Decky's Python could not install anyway. If it cannot be loaded, only Android TV
+  support is lost; Sony is unaffected. The drivers are chosen by the `driver` setting (`sony` or `adb`).
 - Release: raise `version` in `package.json`, commit, then `git tag v1.2.3 && git push origin v1.2.3`.
   GitHub Actions builds the plugin and attaches `NetCEC.zip` (always this name, plus a `.sha256` file) to a
   new release; the build fails if the tag does not match `package.json`.

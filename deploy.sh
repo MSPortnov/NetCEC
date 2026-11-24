@@ -51,7 +51,7 @@ echo ">> pnpm build"; $PNPM build
 [ -f dist/index.js ] || { echo "Сборка не создала dist/index.js"; exit 1; }
 
 echo ">> отправка файлов"
-FILES="plugin.json package.json main.py dist"
+FILES="plugin.json package.json main.py dist py_modules"
 for f in LICENSE THIRD_PARTY_NOTICES.md; do [ -f "$f" ] && FILES="$FILES $f"; done
 ssh $SSHO "$TARGET" 'rm -rf /tmp/netcec-deploy && mkdir -p /tmp/netcec-deploy'
 rsync -az -e "ssh $SSHO" $FILES "$TARGET:/tmp/netcec-deploy/"

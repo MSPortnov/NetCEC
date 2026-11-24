@@ -7,19 +7,39 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
+try:  # loaded once here: importing inside a forked child can deadlock when other threads exist
+    import ctypes
+    _LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+except Exception:
+    _LIBC = None
+
 import decky
+
+# The ADB client (Android TV) is optional: if it cannot be loaded, everything for Sony still works.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "py_modules"))
+try:
+    import netcec_adb
+    _ADB_IMPORT_ERROR = ""
+except Exception as _e:  # noqa: BLE001
+    netcec_adb = None
+    _ADB_IMPORT_ERROR = str(_e)
 
 SETTINGS_FILE = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
 USB_PATH = "/sys/bus/usb/devices"
 _last_resume = 0.0
 _last_renew = 0.0
 _lang = "en"  # UI language for backend messages, refreshed on every _load()
+SUSPEND_STATS = "/sys/power/suspend_stats"  # kernel counters of finished suspend attempts
+MAX_EVENTS = 20       # the journal of recent actions keeps this many entries
+HEAL_AFTER = 6.0      # the TV has not answered for this long: look for it at another address (s)
+_events_lock = threading.Lock()
 _stop = threading.Event()  # set on unload so worker threads end quickly
 
 
@@ -33,37 +53,232 @@ DEFAULTS = {
     "auth_cookie": "",         # set by PIN pairing
     "mac": "",                 # learned automatically, used for Wake-on-LAN
     "hdmi_port": 1,
-    "wake_tv": True,           # what to do on start/resume
-    "switch_input": True,
-    "suspend_action": "none",  # none | off | home
-    "shutdown_action": "none",  # none | off (power off only, never on reboot)
-    "off_only_if_active": True,  # don't power off if TV is on another input
+    "wake_tv": True,           # on start/resume: wake the TV and switch it to our HDMI port
+    "suspend_action": "off",   # on sleep: off | home (only if the TV shows our HDMI port)
+    "shutdown_action": "off",  # on power-off: off | home (only if the TV shows our HDMI port; never on a reboot)
+    "driver": "sony",          # which kind of TV: sony (IP control) | adb (Android TV over ADB)
+    "adb_ok": False,           # the TV has accepted our ADB key (set by the backend only)
+    "settings_version": 5,
     # USB wake sources: {"vid:pid": true|false}
     "wake_rules": {},
+    "journal": False,          # keep (and show) the journal of recent actions; off: nothing is recorded
     "lang": "en",              # resolved UI language, written by the frontend
     "lang_pref": "auto",       # auto | en | ru
 }
 
 
-PRIVATE = ("auth_cookie", "mac")  # stay in the backend, never sent to / accepted from the UI
+PRIVATE = ("auth_cookie", "mac", "adb_ok")  # stay in the backend, never sent to / accepted from the UI
+
+LEAVE_ACTIONS = ("home", "off")  # what to do with the TV on sleep / shutdown (always one of them)
+_settings_lock = threading.RLock()  # every read-modify-write of the settings file holds it
+_USB_ID_RE = re.compile(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{4}")
+
+
+def _host_ok(h):
+    """IPv4 address or plain host name: nothing that could change the URL (/, @, ?, #, spaces)."""
+    if not isinstance(h, str) or not h or len(h) > 253:
+        return False
+    if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", h):
+        return all(int(p) <= 255 for p in h.split("."))
+    label = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    return re.fullmatch(label + r"(?:\." + label + r")*", h) is not None
+
+
+def _is_bool(v):
+    return isinstance(v, bool)
+
+
+# What each setting may contain. A half-typed IP address is allowed (only characters are checked);
+# the strict check is _host_ok() right before the TV is contacted.
+_VALID = {
+    "ip": lambda v: isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9.\-]{0,253}", v) is not None,
+    "auth_cookie": lambda v: isinstance(v, str) and "\r" not in v and "\n" not in v and len(v) < 2000,
+    "mac": lambda v: isinstance(v, str) and (v == "" or re.fullmatch(r"[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}", v) is not None),
+    "hdmi_port": lambda v: isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 8,
+    "wake_tv": _is_bool,
+    "suspend_action": lambda v: v in LEAVE_ACTIONS,
+    "shutdown_action": lambda v: v in LEAVE_ACTIONS,
+    "driver": lambda v: v in ("sony", "adb"),
+    "adb_ok": _is_bool,
+    "settings_version": lambda v: v == 5,
+    "wake_rules": lambda v: isinstance(v, dict),
+    "journal": _is_bool,
+    "lang": lambda v: v in ("en", "ru"),
+    "lang_pref": lambda v: v in ("auto", "en", "ru"),
+}
+
+
+def _sanitize(raw) -> dict:
+    """All keys present, every invalid value replaced by its default."""
+    raw = raw if isinstance(raw, dict) else {}
+    out = {}
+    for key, default in DEFAULTS.items():
+        v = raw.get(key, default)
+        if key == "wake_rules":
+            v = ({k: x for k, x in v.items() if isinstance(k, str) and _USB_ID_RE.fullmatch(k) and isinstance(x, bool)}
+                 if isinstance(v, dict) else {})
+        elif not _VALID[key](v):
+            v = default
+        out[key] = v
+    return out
+
+
+def _migrate(data):
+    """Settings written by older versions are converted step by step.
+    Before 1.3.8 (no settings_version): "wake the TV" and "switch the input" were two switches; they are one now
+    ("wake the TV" also switches the input).
+    Before 1.3.9 (version below 3): sleep and shutdown offered "do nothing" and a separate "only if the TV is on
+    my HDMI port" switch; "do nothing" became "turn off".
+    Before 1.3.10 (version below 4): "turn off if on my port" is the only way now: both actions (home screen /
+    turn off) act only if the TV shows our HDMI port, so that choice became plain "turn off"."""
+    if not data:
+        return data
+    version = data.get("settings_version", 1)
+    if version < 2:
+        if data.get("switch_input") and not data.get("wake_tv"):
+            data["wake_tv"] = True
+        if data.get("shutdown_action") == "off" and data.get("off_only_if_active", True):
+            data["shutdown_action"] = "off_if_mine"
+    if version < 3:
+        mine = data.get("off_only_if_active", True)
+        if data.get("suspend_action", "none") in ("none", "off"):
+            data["suspend_action"] = "off" if data.get("suspend_action") == "off" and not mine else "off_if_mine"
+        if data.get("shutdown_action", "none") == "none":
+            data["shutdown_action"] = "off_if_mine"
+    if version < 4:  # "if the TV is on my HDMI port" is part of every action now: nobody else's TV is touched
+        for key in ("suspend_action", "shutdown_action"):
+            if data.get(key) == "off_if_mine":
+                data[key] = "off"
+    # version 5 only added the "driver" and "adb_ok" settings: the defaults (a Sony TV) are right for old files
+    data["settings_version"] = 5
+    return data
+
+
+def _read_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("settings file is not a JSON object")
+    return data
 
 
 def _load() -> dict:
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            s = {**DEFAULTS, **json.load(f)}
-    except Exception:
-        s = dict(DEFAULTS)
     global _lang
-    _lang = s.get("lang") or "en"
+    with _settings_lock:
+        try:
+            data = _read_file(SETTINGS_FILE)
+        except FileNotFoundError:
+            data = {}
+        except Exception as e:
+            # Never overwrite a damaged file silently: it would wipe the pairing. Use the last good
+            # copy and keep the damaged file next to it for inspection.
+            _log(f"settings file unreadable ({e}); trying the backup")
+            try:
+                data = _read_file(SETTINGS_FILE + ".bak")
+                restored = True
+            except Exception:
+                data, restored = {}, False
+            try:
+                os.replace(SETTINGS_FILE, SETTINGS_FILE + ".corrupt")
+            except OSError:
+                pass
+            if restored:
+                _save(data)
+                _log("settings restored from the backup")
+        s = _sanitize(_migrate(data))
+    _lang = s["lang"]
     return s
 
 
 def _save(settings: dict) -> None:
-    os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
-    clean = {k: settings.get(k, v) for k, v in DEFAULTS.items()}
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(clean, f, ensure_ascii=False, indent=2)
+    """Atomic: write a temporary file, keep the last good version as .bak, then rename over the
+    real file. The file holds the pairing key, so it is private to its owner (0600)."""
+    clean = _sanitize(settings)
+    with _settings_lock:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        tmp = SETTINGS_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(clean, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        try:  # only a readable file may become the backup
+            _read_file(SETTINGS_FILE)
+            shutil.copyfile(SETTINGS_FILE, SETTINGS_FILE + ".bak")
+            os.chmod(SETTINGS_FILE + ".bak", 0o600)
+        except Exception:
+            pass
+        os.replace(tmp, SETTINGS_FILE)
+
+
+def _update(change) -> dict:
+    """Read-modify-write under one lock: concurrent changes (UI, pairing renewal, worker threads)
+    can no longer overwrite each other. `change(settings)` edits the dict in place."""
+    with _settings_lock:
+        s = _load()
+        change(s)
+        _save(s)
+        return s
+
+
+def _suspend_count():
+    """How many suspend attempts have finished (successful + failed), as counted by the kernel; None if the
+    kernel does not tell. Every attempt adds exactly one, so the three "the device woke up" sources can be
+    told apart from a second real wake-up without any timer."""
+    try:
+        total = 0
+        for name in ("success", "fail"):
+            with open(f"{SUSPEND_STATS}/{name}") as f:
+                total += int(f.read().strip())
+        return total
+    except Exception:
+        return None
+
+
+def _events_file():
+    return os.path.join(os.path.dirname(SETTINGS_FILE), "events.json")
+
+
+def _read_events():
+    try:
+        with open(_events_file(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [e for e in data if isinstance(e, dict)] if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _clear_events():
+    with _events_lock:
+        try:
+            os.remove(_events_file())
+        except OSError:
+            pass
+
+
+def _record(kind, ok, text):
+    """Journal of what the plugin did (shown in the UI, newest first). Does nothing while the journal is
+    switched off. Never raises."""
+    try:
+        if not _load()["journal"]:
+            return
+        with _events_lock:
+            events = _read_events()
+            events.insert(0, {"t": int(time.time()), "kind": kind, "ok": bool(ok), "text": str(text)[:200]})
+            del events[MAX_EVENTS:]
+            tmp = _events_file() + ".tmp"
+            os.makedirs(os.path.dirname(tmp), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(events, f, ensure_ascii=False)
+            os.replace(tmp, _events_file())
+    except Exception as e:
+        _log(f"could not write the events journal: {e}")
+
+
+def _record_result(kind, res):
+    """Journal entry for the result of an action; nothing for "nothing to do" and for quiet results."""
+    if res and not res.get("quiet") and not res.get("empty"):
+        _record(kind, res["ok"], res.get("plain") or res["message"])
 
 
 def _log(msg):
@@ -92,11 +307,15 @@ TR = {
         "need_auth": "Pair with the TV first (Show PIN on TV)",
         "need_pair": "Pairing lost or expired. Pair with the TV again (PIN)",
         "not_paired": "Not paired",
-        "already_on": "TV is already on",
         "no_wake": "TV did not wake (check Remote start / network standby)",
         "switched": "Switched to HDMI {port}",
+        "adb_approve": "Confirm on the TV: \u201cAllow USB debugging?\u201d, choose \u201cAlways allow\u201d, then press Connect again.",
+        "adb_unavailable": "Android TV support is not available: {err}",
+        "what_undetectable": "input could not be determined",
+        "switched_in": "Switched to HDMI {port} in {secs} s",
+        "ip_changed": "TV found at its new address {ip}",
         "switch_failed": "Input switch failed: {err}",
-        "not_switched": "TV did not switch to HDMI {port}",
+        "sent_unconfirmed": "HDMI {port}: switch command sent, the TV did not confirm it",
         "what_unknown": "unknown input",
         "what_other": "another input",
         "left_on": "TV left on ({what})",
@@ -132,11 +351,15 @@ TR = {
         "need_auth": "Сначала выполните сопряжение с ТВ (кнопка «Показать PIN на ТВ»)",
         "need_pair": "Сопряжение потеряно или истекло. Выполните сопряжение с ТВ заново (PIN)",
         "not_paired": "Не сопряжено",
-        "already_on": "ТВ уже включён",
         "no_wake": "ТВ не включился (проверьте «Remote start» и сетевой режим ожидания)",
         "switched": "Переключено на HDMI {port}",
+        "adb_approve": "Подтвердите на ТВ запрос \u00abРазрешить отладку\u00bb (выберите \u00abВсегда разрешать\u00bb) и нажмите \u00abПодключить\u00bb ещё раз.",
+        "adb_unavailable": "Поддержка Android TV недоступна: {err}",
+        "what_undetectable": "вход определить не удалось",
+        "switched_in": "Переключено на HDMI {port} за {secs} с",
+        "ip_changed": "ТВ найден по новому адресу {ip}",
         "switch_failed": "Не удалось переключить вход: {err}",
-        "not_switched": "ТВ не переключился на HDMI {port}",
+        "sent_unconfirmed": "HDMI {port}: команда отправлена, ТВ не подтвердил переключение",
         "what_unknown": "вход неизвестен",
         "what_other": "другой вход",
         "left_on": "ТВ оставлен включённым ({what})",
@@ -225,16 +448,26 @@ def _rest(s, service, method, params=None, timeout=4):
     return res
 
 
-def _current_port(s, timeout=4):
-    """HDMI port the TV currently shows; 0 = something else; None = unknown."""
+def _look(s, timeout=4):
+    """(port, what): which HDMI port the TV shows (0 = something else, None = no answer at all) and a
+    short text for the log. An error ANSWER (the TV is on its home screen or screensaver and plays
+    nothing) means the TV is reachable, so the port is 0, not None: otherwise a TV that is on would be
+    treated as switched off."""
     try:
         uri = _rest(s, "avContent", "getPlayingContentInfo", timeout=timeout)["result"][0].get("uri", "")
     except AuthError:
         raise
-    except Exception:
-        return None
+    except RuntimeError as e:  # raised by _rest for an error response of the TV
+        return 0, f"error {e}"[:60]
+    except Exception as e:  # no connection, timeout, malformed answer
+        return None, f"no answer ({type(e).__name__})"
     m = re.match(r"extInput:hdmi\?port=(\d+)", uri)
-    return int(m.group(1)) if m else 0
+    return (int(m.group(1)), f"hdmi {m.group(1)}") if m else (0, f"other {uri[:50]}")
+
+
+def _current_port(s, timeout=4):
+    """HDMI port the TV currently shows; 0 = something else; None = the TV did not answer."""
+    return _look(s, timeout)[0]
 
 
 def _guess_mac(ip):
@@ -263,9 +496,7 @@ def _learn_mac(s):
     if not s.get("mac"):
         mac = _guess_mac(s["ip"])
         if mac:
-            cur = _load()
-            cur["mac"] = mac
-            _save(cur)
+            _update(lambda cur: cur.update(mac=mac))
             s["mac"] = mac
 
 
@@ -297,9 +528,7 @@ def _register(s, pin=None, cookie=None):
 
 
 def _store_cookie(s, cookie):
-    cur = _load()
-    cur["auth_cookie"] = cookie
-    _save(cur)
+    _update(lambda cur: cur.update(auth_cookie=cookie))
     s["auth_cookie"] = cookie
     _learn_mac(s)  # the TV has just answered, so its MAC (for Wake-on-LAN) is in the ARP table
 
@@ -335,11 +564,16 @@ def _guard(fn):
 
 
 def _pair_start(s):
-    if not s["ip"]:
+    if not _host_ok(s["ip"]):
         return _fail(_t("need_ip"))
+    if _is_adb(s):
+        return _adb_pair(s)
     try:
         code, cookie = _register(s)
     except Exception as e:
+        if _port_open(s["ip"], ADB_PORT):  # no Sony API, but ADB answers: an Android TV
+            s["driver"] = "adb"
+            return _adb_pair(s)
         return _fail(_t("no_conn", err=e))
     if code == 401:
         return _ok(_t("pin_enter"))
@@ -351,7 +585,7 @@ def _pair_start(s):
 
 def _pair_finish(s, pin):
     pin = (pin or "").strip()
-    if not s["ip"] or not pin:
+    if not _host_ok(s["ip"]) or not pin:
         return _fail(_t("pair_need_pin"))
     try:
         code, cookie = _register(s, pin)
@@ -365,10 +599,15 @@ def _pair_finish(s, pin):
     return _fail(_t("pair_failed", code=code))
 
 
+def _paired(s):
+    """A TV is set up: Sony needs the pairing key, an Android TV needs the accepted ADB key."""
+    return bool(s["ip"] and (s["adb_ok"] if s["driver"] == "adb" else s["auth_cookie"]))
+
+
 def _tv_check(s):
-    if not s["ip"]:
+    if not _host_ok(s["ip"]):
         return _fail(_t("need_ip"))
-    if not s["auth_cookie"]:
+    if not _paired(s):
         return _fail(_t("need_auth"))
     return None
 
@@ -377,8 +616,16 @@ def _tv_check(s):
 def _status(s):
     if not s["ip"]:
         return _fail(_t("not_configured"))
-    if not s["auth_cookie"]:
+    if not _paired(s):
         return _fail(_t("not_paired"))
+    if _is_adb(s):
+        port, what = _adb_look(s, 3.0)
+        if port is None:
+            if what.startswith("asleep"):
+                return _ok(_t("tv_state", st=_t("st_standby")))
+            return _fail(_t("no_conn", err=what))
+        where = _t("where_unknown") if port < 0 else (_t("where_other") if port == 0 else f"HDMI {port}")
+        return _ok(_t("tv_on", where=where))
     try:
         st = _rest(s, "system", "getPowerStatus")["result"][0]["status"]
     except urllib.error.HTTPError as e:
@@ -394,7 +641,8 @@ def _status(s):
     return _ok(_t("tv_on", where=where))
 
 
-IRCC_HOME = "AAAAAQAAAAEAAABgAw=="  # remote control "Home" key
+IRCC_HOME = "AAAAAQAAAAEAAABgAw=="  # remote control "Home" key (Sony's standard IRCC codes)
+IRCC_BACK = "AAAAAgAAAJcAAAAjAw=="  # "Back" (Return): ends a screensaver
 
 
 def _ircc(s, code, timeout=3):
@@ -417,26 +665,52 @@ def _ircc(s, code, timeout=3):
         raise
 
 
+def _rediscover_ip(s):
+    """The TV got another address from the router? Look for a Sony TV on the network whose MAC address is the
+    one we paired with. A TV that is off does not answer the search, so nothing changes then."""
+    mac = (s.get("mac") or "").lower().replace("-", ":")
+    if not mac:
+        return None
+    for tv in _discover(timeout=2.5):
+        if tv["ip"] != s["ip"] and _guess_mac(tv["ip"]).lower().replace("-", ":") == mac:
+            return tv["ip"]
+    return None
+
+
+LEAVE_LOOK_TIMEOUTS = (2.0, 1.5)  # the TV is sometimes slow to answer: the question is asked twice at most
+
+
 @_guard
 def _leave(s, mode):
     """Fast path for sleep/shutdown (logind waits about 5 s): few round trips, short timeouts.
-    mode: 'off' = power off, 'home' = Android TV home screen."""
+    mode: 'off' = power off, 'home' = Android TV home screen.
+    Only if the TV shows our HDMI port: a TV somebody else is watching is never touched."""
     bad = _tv_check(s)
     if bad:
         return bad
     t0 = time.monotonic()
-    if s["off_only_if_active"]:
-        cur = _current_port(s, timeout=2)
-        _log(f"leave: input check {time.monotonic() - t0:.2f}s -> {cur}")
-        if cur != int(s["hdmi_port"]):
-            label = _t("what_unknown") if cur is None else (_t("what_other") if cur == 0 else f"HDMI {cur}")
-            return _ok(_t("left_on", what=label))
+    cur = None
+    for timeout in LEAVE_LOOK_TIMEOUTS:
+        cur = _t_current_port(s, timeout=timeout)
+        if cur is not None:  # an answer, even "something else"; only silence is asked again
+            break
+    _log(f"leave: input check {time.monotonic() - t0:.2f}s -> {cur}")
+    if cur != int(s["hdmi_port"]):
+        if cur is None:
+            label = _t("what_unknown")
+        elif cur == 0:
+            label = _t("what_other")
+        elif cur < 0:
+            label = _t("what_undetectable")  # an Android TV that is on, whose input cannot be told: not touched
+        else:
+            label = f"HDMI {cur}"
+        return _ok(_t("left_on", what=label))
     try:
         if mode == "home":
-            _ircc(s, IRCC_HOME, timeout=2)
+            _t_home(s)
             msg = _t("home_sent")
         else:
-            _rest(s, "system", "setPowerStatus", [{"status": False}], timeout=2)
+            _t_off(s)
             msg = _t("turning_off")
     except AuthError:
         raise
@@ -454,61 +728,317 @@ def _power_state(s):
         return None
 
 
-SEND_TIMEOUT = 2    # seconds for every request to the TV while waking / switching
-SWITCH_SENDS = 3    # how many times the input switch is sent before giving up
-HOME_PAUSE = 0.4    # pause between the Home key and the input switch (s)
-WAKE_WINDOW = 45    # how long a sleeping TV may take to wake up (s)
+# ---------- Android TV over ADB ----------
+
+ADB_PORT = 5555
+ADB_APPROVAL_WAIT = 25.0  # pairing waits this long for the user to accept our key on the TV (s)
+ADB_IDLE = 30.0           # a connection that was not used for this long is not reused (s)
+
+# How to open an HDMI port, per brand. The ids are those of the TV's own inputs (they differ between TVs).
+ANDROID_TV_INPUTS = {
+    "tcl": {
+        "uri": "content://android.media.tv/passthrough/com.tcl.tvinput%2F.passthroughinput.TvPassThroughService%2F{hw}",
+        "hw": {1: "HW1413744128", 2: "HW1413744384", 3: "HW1413744640", 4: "HW1413745664"},
+    },
+}
+GENERIC_HDMI_KEYCODES = {1: 243, 2: 244, 3: 245, 4: 246}  # KEYCODE_TV_INPUT_HDMI_1..4: a guess for other brands
+
+_adb_lock = threading.RLock()
+_adb_state = {"ip": None, "conn": None, "used": 0.0, "key": None, "brand": {}}
+
+# one round trip: power state, the last HDMI input that was opened, the activity in front
+_ADB_LOOK_CMD = ("dumpsys power | grep -m1 mWakefulness=; echo '##starter'; "
+                 "dumpsys activity starter | grep -o 'HW[0-9]*' | head -3; echo '##resumed'; "
+                 "dumpsys activity activities | grep -m2 -E 'topResumedActivity|mResumedActivity'")
+
+
+def _adb_key():
+    if _adb_state["key"] is None:
+        _adb_state["key"] = netcec_adb.load_or_create_key(os.path.join(os.path.dirname(SETTINGS_FILE), "adbkey.json"))
+    return _adb_state["key"]
+
+
+def _adb_drop():
+    """Close the cached connection (never waits: it is also called while the plugin unloads)."""
+    conn, _adb_state["conn"] = _adb_state["conn"], None
+    if conn:
+        conn.close()
+
+
+def _adb_connection(s):
+    st = _adb_state
+    if st["conn"] and st["ip"] == s["ip"] and st["conn"].alive and time.monotonic() - st["used"] < ADB_IDLE:
+        return st["conn"], True
+    _adb_drop()
+    conn = netcec_adb.Connection(s["ip"], _adb_key(), port=ADB_PORT, timeout=3.0).connect()
+    st.update(ip=s["ip"], conn=conn)
+    return conn, False
+
+
+def _adb_shell(s, command, timeout=4.0):
+    """Run a shell command on the Android TV. One connection is reused for a short time; if a reused connection
+    turns out to be dead, it is opened again once."""
+    if netcec_adb is None:
+        raise RuntimeError(_t("adb_unavailable", err=_ADB_IMPORT_ERROR))
+    with _adb_lock:
+        for attempt in (1, 2):
+            conn, reused = _adb_connection(s)
+            try:
+                out = conn.shell(command, timeout)
+                _adb_state["used"] = time.monotonic()
+                return out
+            except Exception:
+                _adb_drop()
+                if not reused or attempt == 2:
+                    raise
+
+
+def _adb_brand(s):
+    brands = _adb_state["brand"]
+    if s["ip"] not in brands:
+        out = _adb_shell(s, "getprop ro.product.manufacturer; getprop ro.product.brand", 3.0).lower()
+        brands[s["ip"]] = "tcl" if "tcl" in out else "other"
+    return brands[s["ip"]]
+
+
+def _adb_parse_look(text, hw_ports):
+    """(port, what) from the output of _ADB_LOOK_CMD: the port the TV shows, 0 = something else, -1 = the TV is on
+    but the input cannot be told, None = the TV is off."""
+    power = re.search(r"mWakefulness=(\w+)", text)
+    if not power:
+        return -1, "no power state in the answer"
+    if power.group(1) in ("Asleep", "Dozing"):
+        return None, f"asleep ({power.group(1)})"
+    parts = text.split("##starter", 1)[-1].split("##resumed", 1)
+    starter, resumed = parts[0], (parts[1] if len(parts) > 1 else "")
+    shown = " ".join(resumed.split())[:80]
+    if not any(word in resumed.lower() for word in ("tvinput", "passthrough", "hdmi")):
+        return 0, f"awake, not on an input ({shown or 'no activity'})"
+    for hw in re.findall(r"HW\d+", starter):  # the most recently opened input first
+        if hw in hw_ports:
+            return hw_ports[hw], f"hdmi {hw_ports[hw]} ({hw})"
+    return -1, f"on an input, which one is unknown ({shown})"
+
+
+def _adb_look(s, timeout=4):
+    try:
+        brand = _adb_brand(s)
+        out = _adb_shell(s, _ADB_LOOK_CMD, max(timeout, 3.0))
+    except Exception as e:
+        return None, f"no answer ({type(e).__name__})"
+    hw_ports = {hw: port for port, hw in ANDROID_TV_INPUTS.get(brand, {}).get("hw", {}).items()}
+    port, what = _adb_parse_look(out, hw_ports)
+    _log(f"adb look: {what} | {' '.join(out.split())[:240]}")  # the raw answer, to calibrate the detection
+    return port, what
+
+
+def _adb_power_state(s):
+    out = _adb_shell(s, "dumpsys power | grep -m1 mWakefulness=", SEND_TIMEOUT + 1)
+    m = re.search(r"mWakefulness=(\w+)", out)
+    if not m:
+        raise RuntimeError("no power state")
+    return "standby" if m.group(1) in ("Asleep", "Dozing") else "active"
+
+
+def _adb_switch(s, port):
+    profile = ANDROID_TV_INPUTS.get(_adb_brand(s))
+    if profile and port in profile["hw"]:
+        uri = profile["uri"].format(hw=profile["hw"][port])
+        out = _adb_shell(s, f'am start -a android.intent.action.VIEW -d "{uri}"', 4.0)
+        if "Error" in out or "Exception" in out:
+            raise RuntimeError(" ".join(out.split())[:120])
+        return
+    code = GENERIC_HDMI_KEYCODES.get(port)
+    if code is None:
+        raise RuntimeError(f"HDMI {port} is not supported on this TV")
+    _adb_shell(s, f"input keyevent {code}", SEND_TIMEOUT + 1)
+
+
+def _port_open(ip, port, timeout=0.8):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _adb_pair(s):
+    """Connect to an Android TV and wait until the user accepts our key on its screen."""
+    if netcec_adb is None:
+        return _fail(_t("adb_unavailable", err=_ADB_IMPORT_ERROR))
+    try:
+        with _adb_lock:
+            _adb_drop()
+            netcec_adb.Connection(s["ip"], _adb_key(), port=ADB_PORT, timeout=4.0).connect(
+                approval_wait=ADB_APPROVAL_WAIT).close()
+    except netcec_adb.NeedsApproval:
+        return _fail(_t("adb_approve"))
+    except Exception as e:
+        return _fail(_t("no_conn", err=e))
+    _update(lambda cur: cur.update(driver="adb", adb_ok=True))
+    s["driver"], s["adb_ok"] = "adb", True
+    _learn_mac(s)
+    return _ok(_t("paired"))
+
+
+# ---------- the TV, whatever kind it is: what _tv_fast and _leave ask of a TV ----------
+
+def _is_adb(s):
+    return s.get("driver") == "adb"
+
+
+def _t_power_state(s):
+    return _adb_power_state(s) if _is_adb(s) else _power_state(s)
+
+
+def _t_look(s, timeout):
+    return _adb_look(s, timeout) if _is_adb(s) else _look(s, timeout=timeout)
+
+
+def _t_current_port(s, timeout=4):
+    return _adb_look(s, timeout)[0] if _is_adb(s) else _current_port(s, timeout=timeout)
+
+
+def _t_back(s):
+    """The key that ends a screensaver (pressed before the input switch)."""
+    if _is_adb(s):
+        _adb_shell(s, "input keyevent 4", SEND_TIMEOUT + 1)
+    else:
+        _ircc(s, IRCC_BACK, timeout=SEND_TIMEOUT)
+
+
+def _t_switch(s, port):
+    if _is_adb(s):
+        _adb_switch(s, port)
+    else:
+        _rest(s, "avContent", "setPlayContent", [{"uri": f"extInput:hdmi?port={port}"}], timeout=SEND_TIMEOUT)
+
+
+def _t_wake(s):
+    """Power on (and Wake-on-LAN): neither may fail the caller."""
+    try:
+        if _is_adb(s):
+            _adb_shell(s, "input keyevent 224", SEND_TIMEOUT + 1)
+        else:
+            _rest(s, "system", "setPowerStatus", [{"status": True}], timeout=SEND_TIMEOUT)
+    except Exception:
+        pass
+    try:
+        _wol(s)
+    except Exception:
+        pass
+
+
+def _t_home(s):
+    if _is_adb(s):
+        _adb_shell(s, "input keyevent 3", 3.0)
+    else:
+        _ircc(s, IRCC_HOME, timeout=2)
+
+
+def _t_off(s):
+    if _is_adb(s):
+        _adb_shell(s, "input keyevent 223", 3.0)
+    else:
+        _rest(s, "system", "setPowerStatus", [{"status": False}], timeout=2)
+
+
+def _t_verifies(s):
+    """Can the TV tell which input it shows? Sony can; the answer of an Android TV is only a guess, so a switch
+    there is taken as done when the command went through."""
+    return not _is_adb(s)
+
+
+SEND_TIMEOUT = 2      # seconds for every request to the TV while waking / switching
+KEY_PAUSE = 0.1       # pause between the key press (ends a screensaver) and the input switch (s)
+CONFIRM_STEP = 0.4    # after the switch the TV is asked this often which input it shows (s) ...
+CONFIRM_WINDOW = 8.0  # ... for this long: after a resume a TV reports the input only after 5-9 s (until then: "Illegal State")
+SWITCH_SENDS = 2      # the switch command is sent at most this many times (never more while the TV is busy)
+RETRY_PAUSE = 0.25    # pause between attempts while the TV or the network is not answering yet (s)
+WAKE_WINDOW = 45      # how long a sleeping TV may take to wake up (s)
 
 
 def _tv_fast(s):
-    """Wake and/or switch the input as early as possible and stop as soon as it is confirmed.
+    """Wake the TV and switch it to our HDMI port as early as possible.
     The TV is asked at once which input it shows (it is usually already on): if that is the right
-    HDMI port nothing is sent. Otherwise the Home key is sent first (it ends a running screensaver,
-    which a plain input switch does not), then the input switch; afterwards the TV is asked again
-    and nothing more is sent once it is on the right port (the switch is repeated up to
-    SWITCH_SENDS times). If the TV is off, it is woken (power on + Wake-on-LAN) every ~3 s and
-    polled until it is active, for up to WAKE_WINDOW seconds."""
+    HDMI port nothing is sent. Otherwise the remote's Back key is pressed first (it ends a running
+    screensaver, which a plain input switch does not), then the input switch is sent once. Then the TV is
+    asked every CONFIRM_STEP until it reports the port: it needs seconds for that, and sending the command again
+    while it is still busy only restarts its switching. Only if it has not confirmed after
+    CONFIRM_WINDOW the command is sent one more time; after that the result is "sent, not confirmed".
+    If the TV is off, it is woken (power on + Wake-on-LAN) every ~3 s and polled until it is
+    active, for up to WAKE_WINDOW seconds."""
     bad = _tv_check(s)
     if bad:
         return bad
     port = int(s["hdmi_port"])
-    want_sw, want_wake = s["switch_input"], s["wake_tv"]
-    deadline = time.monotonic() + WAKE_WINDOW
-    renewed, n, sends, last, first = False, 0, 0, "", True
+    t0 = time.monotonic()
+    deadline = t0 + WAKE_WINDOW
+    renewed, n, sends, last, first, healing_tried = False, 0, 0, "", True, False
+    steps, saw, answered = [], [], []  # for the log: step durations, what the TV said, when it first answered
+
+    def look():
+        t1 = time.monotonic()
+        cur, what = _t_look(s, SEND_TIMEOUT)
+        if cur is not None and not answered:
+            answered.append(time.monotonic() - t0)
+        if len(saw) < 16:
+            saw.append(f"{what} {time.monotonic() - t1:.2f}")
+        return cur
+
+    def timed(label, fn, *args, **kwargs):
+        t1 = time.monotonic()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            steps.append(f"{label} {time.monotonic() - t1:.2f}")
+
+    def summary():
+        reach = f"TV answered after {answered[0]:.1f} s; " if answered else ""
+        return f"{reach}steps: {', '.join(steps)}; TV said: {' | '.join(saw)}"
+
     while time.monotonic() < deadline and not _stop.is_set():
         st = None
         try:
-            if not (first and want_sw):  # first try: no state check, just switch
-                st = _power_state(s)
-            if (first and want_sw) or st == "active":
-                if not want_sw:
-                    return _ok(_t("already_on"))
-                cur = _current_port(s, timeout=SEND_TIMEOUT)
+            if not first:  # first try: no state check, just look at the input and switch
+                st = _t_power_state(s)
+            if first or st == "active":
+                cur = look()
                 if cur == port:  # already on the right input: nothing to send
+                    _log(f"TV: already on HDMI {port} ({summary()})")
                     return _ok(_t("switched", port=port))
                 if cur is None and first:  # no answer and the state is unknown: TV off, go and wake it
                     raise RuntimeError("TV not reachable")
-                if sends == 0:  # the Home key ends a running screensaver; not critical if it fails
+                if sends == 0:  # any key ends a running screensaver; not critical if it fails
                     try:
-                        _ircc(s, IRCC_HOME, timeout=SEND_TIMEOUT)
-                        time.sleep(HOME_PAUSE)
+                        timed("key", _t_back, s)
+                        time.sleep(KEY_PAUSE)
                     except AuthError:
                         raise
                     except Exception:
                         pass
-                _rest(s, "avContent", "setPlayContent", [{"uri": f"extInput:hdmi?port={port}"}],
-                      timeout=SEND_TIMEOUT)
+                timed("switch", _t_switch, s, port)
                 sends += 1
                 _learn_mac(s)
-                time.sleep(0.5)  # give the TV a moment to change the input
-                cur = _current_port(s, timeout=SEND_TIMEOUT)
-                if cur == port or cur is None:  # confirmed (None: cannot be checked, trust the reply)
-                    return _ok(_t("switched", port=port))
-                if sends >= SWITCH_SENDS:
-                    return _fail(_t("not_switched", port=port))
+                if not _t_verifies(s):  # the command went through and that is all this kind of TV can tell
+                    _log(f"TV: HDMI {port} switch command sent, {time.monotonic() - t0:.1f} s ({summary()})")
+                    return _ok(_t("switched_in", port=port, secs=f"{time.monotonic() - t0:.1f}"))
+                t1, confirmed = time.monotonic(), False
+                while time.monotonic() - t1 < CONFIRM_WINDOW and not _stop.is_set():
+                    time.sleep(CONFIRM_STEP)
+                    if look() == port:
+                        confirmed = True
+                        break
+                steps.append(f"wait {time.monotonic() - t1:.2f}")
+                if confirmed:
+                    _log(f"TV: HDMI {port} confirmed after {time.monotonic() - t0:.1f} s, "
+                         f"{sends} switch command(s) ({summary()})")
+                    return _ok(_t("switched_in", port=port, secs=f"{time.monotonic() - t0:.1f}"))
+                if sends >= SWITCH_SENDS:  # the command was accepted, the TV just never said so
+                    _log(f"TV: HDMI {port} command sent {sends}x, not confirmed ({summary()})")
+                    return _ok(_t("sent_unconfirmed", port=port))
                 first = False
-                time.sleep(0.4)
-                continue
+                continue  # nothing happened for a whole window: send the command once more
         except AuthError:
             if renewed or not _renew(s, force=True):
                 raise
@@ -517,31 +1047,35 @@ def _tv_fast(s):
         except Exception as e:
             last = str(e)
         first = False
-        if want_wake and st != "active" and n % 7 == 0:
-            try:
-                _rest(s, "system", "setPowerStatus", [{"status": True}], timeout=SEND_TIMEOUT)
-            except Exception:
-                pass
-            try:
-                _wol(s)
-            except Exception:
-                pass
+        if not answered and not healing_tried and time.monotonic() - t0 >= HEAL_AFTER:
+            healing_tried = True  # once per run: a TV that is simply off does not answer the search either
+            new_ip = _rediscover_ip(s)
+            if new_ip:
+                s["ip"] = new_ip
+                _update(lambda cur: cur.update(ip=new_ip))
+                _record("wake", True, _t("ip_changed", ip=new_ip))
+                _log(f"TV: found at the new address {new_ip}")
+                first = True  # try the switch at once
+                continue
+        if st != "active" and n % 12 == 0:
+            _t_wake(s)
         n += 1
-        time.sleep(0.4)
-    return _fail(_t("no_wake")) if want_wake else _fail(_t("switch_failed", err=last))
+        time.sleep(RETRY_PAUSE)
+    _log(f"TV: gave up after {time.monotonic() - t0:.1f} s ({summary()})")
+    return _fail(_t("switch_failed", err=last)) if answered else _fail(_t("no_wake"))
 
 
 @_guard
 def _tv_actions(s):
     """Wake/switch according to settings. None = nothing configured."""
-    if not s["ip"] or not (s["wake_tv"] or s["switch_input"]):
+    if not s["ip"] or not s["wake_tv"]:
         return None
     return _tv_fast(s)
 
 
 @_guard
 def _tv_suspend(s):
-    if not s["ip"] or s["suspend_action"] not in ("off", "home"):
+    if not s["ip"]:
         return None
     return _leave(s, s["suspend_action"])
 
@@ -553,13 +1087,12 @@ def _is_reboot():
 
 @_guard
 def _tv_shutdown(s, typ=None):
-    act = s["shutdown_action"]
-    if not s["ip"] or act == "none":
+    if not s["ip"]:
         return None
     reboot = (typ in ("reboot", "kexec", "soft-reboot")) if typ else _is_reboot()
     if reboot:  # the TV is only turned off on a real power-off, never on a reboot
-        return _ok(_t("reboot_left"))
-    return _leave(s, "off")
+        return {**_ok(_t("reboot_left")), "quiet": True}
+    return _leave(s, s["shutdown_action"])
 
 
 # ---------- finding the TV on the network (SSDP / UPnP) ----------
@@ -651,7 +1184,8 @@ def _parse_tv_description(xml_text):
 
 
 def _discover(timeout=3.0):
-    """Sony Bravia TVs on the local network: [{"ip", "name", "model"}]."""
+    """TVs on the local network: Sony Bravias and Android TVs with network debugging on.
+    [{"ip", "name", "model", "kind"}], kind is "sony" or "adb"."""
     try:
         locations = _ssdp_search(timeout)
     except Exception as e:
@@ -661,15 +1195,20 @@ def _discover(timeout=3.0):
     found = {}
 
     def check(ip, device_locations):
+        cast = None  # an Android TV answers as a Chromecast (DIAL) device
         for location in device_locations:
             xml = _fetch_description(ip, location)
             info = _parse_tv_description(xml) if xml else None
             if info:
-                found[ip] = {"ip": ip, "name": info[0], "model": info[1]}
+                found[ip] = {"ip": ip, "name": info[0], "model": info[1], "kind": "sony"}
                 return
             if xml:
+                if cast is None and "dial-multiscreen-org" in xml:
+                    cast = (_xml_text(xml, "friendlyName"), _xml_text(xml, "modelName"), _xml_text(xml, "manufacturer"))
                 _log(f"SSDP: {ip} {location}: not a Bravia (manufacturer={_xml_text(xml, 'manufacturer') or '?'}, "
                      f"model={_xml_text(xml, 'modelName') or '?'}, scalar-api={'ScalarWebAPI' in xml})")
+        if cast and netcec_adb is not None and _port_open(ip, ADB_PORT):  # network debugging is on: usable
+            found[ip] = {"ip": ip, "name": cast[0], "model": cast[1] or cast[2], "kind": "adb"}
 
     threads = [threading.Thread(target=check, args=item, daemon=True) for item in list(locations.items())[:16]]
     for t in threads:
@@ -678,7 +1217,7 @@ def _discover(timeout=3.0):
         t.join(6)
     tvs = list(found.values())
     tvs.sort(key=lambda t: ("bravia" not in (t["name"] + t["model"]).lower(), t["ip"]))
-    _log(f"SSDP: {len(locations)} device(s) answered, {len(tvs)} Sony TV(s) found")
+    _log(f"SSDP: {len(locations)} device(s) answered, {len(tvs)} TV(s) found")
     return tvs
 
 
@@ -710,8 +1249,8 @@ def _kill_group(p):
 def _pdeathsig():
     """Run in the child: get SIGKILL when the plugin process dies (no orphaned lock or monitor)."""
     try:
-        import ctypes
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, 9)  # PR_SET_PDEATHSIG, SIGKILL
+        if _LIBC:
+            _LIBC.prctl(1, 9)  # PR_SET_PDEATHSIG, SIGKILL
     except Exception:
         pass
 
@@ -791,26 +1330,31 @@ async def _resume_all():
     tasks["TV"] = asyncio.to_thread(_tv_actions, s)
     tasks["Wake"] = asyncio.to_thread(_apply_wake_rules, s)
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-    parts, ok = [], True
+    parts, plain, ok = [], [], True
     for name, r in zip(tasks, results):
         if isinstance(r, Exception):
             parts.append(f"{_t('part_' + name.lower())}: {_t('error')} {r}")
+            plain.append(f"{_t('error')} {r}")
             ok = False
         elif r is not None:
             parts.append(f"{_t('part_' + name.lower())}: {r['message']}")
+            plain.append(r["message"])
             ok = ok and r["ok"]
-    res = {"ok": ok, "message": "; ".join(parts) if parts else _t("nothing")}
+    res = {"ok": ok, "message": "; ".join(parts) if parts else _t("nothing"),
+           "plain": "; ".join(plain), "empty": not parts}
     _log(f"actions done: {res}")
     return res
 
 
 class Plugin:
     _lock = None   # systemd-inhibit process holding the sleep/shutdown delay lock
+    _lock_mutex = None  # makes taking the lock atomic (two quick calls must not start two)
     _mon = None    # dbus-monitor process (logind signals)
     _tasks = ()
     _bg = set()
     _sleep_fut = None   # sleep actions of the current sleep (shared by the Steam hook and logind)
     _sleep_ts = 0.0
+    _last_suspends = None  # the kernel's count of finished suspend attempts at the last handled resume
     _plain_task = None
     _meta_ts = 0.0
 
@@ -820,23 +1364,29 @@ class Plugin:
         t.add_done_callback(self._bg.discard)
         return t
 
-    async def _emit(self, result):
-        try:
-            await decky.emit("resume_result", result)
-        except Exception as e:
-            _log(f"emit failed: {e}")
+    # ----- journal
+    async def get_events(self) -> list:
+        def read():
+            return _read_events()[:5] if _load()["journal"] else []
+        return await asyncio.to_thread(read)
 
     # ----- settings / info
     async def get_settings(self) -> dict:
         s = _load()
         out = {k: v for k, v in s.items() if k not in PRIVATE}  # the UI never sees the pairing key
-        out["paired"] = bool(s["auth_cookie"] and s["ip"])
+        out["paired"] = _paired(s)
         return out
 
     async def set_settings(self, patch: dict) -> None:
-        s = _load()
-        s.update({k: v for k, v in patch.items() if k in DEFAULTS and k not in PRIVATE})
-        _save(s)
+        def apply(s):
+            for k, v in (patch or {}).items():
+                if k in DEFAULTS and k not in PRIVATE and _VALID[k](v):
+                    s[k] = v
+                else:
+                    _log(f"settings: ignored {k!r}")
+        await asyncio.to_thread(_update, apply)
+        if (patch or {}).get("journal") is False:
+            await asyncio.to_thread(_clear_events)  # switched off: nothing stays behind
         await self._take_lock()
 
     async def get_info(self) -> dict:
@@ -854,15 +1404,18 @@ class Plugin:
         return await asyncio.to_thread(_pair_start, _load())
 
     async def pair_finish(self, pin: str) -> dict:
-        return await asyncio.to_thread(_pair_finish, _load(), pin)
+        result = await asyncio.to_thread(_pair_finish, _load(), pin)
+        if result.get("ok"):
+            await self._take_lock()  # a TV is paired now: sleep and shutdown have something to do
+        return result
 
     async def tv_status(self) -> dict:
         return await asyncio.to_thread(_status, _load())
 
     async def tv_unpair(self) -> dict:
-        s = _load()
-        s.update(ip="", auth_cookie="", mac="")
-        _save(s)
+        await asyncio.to_thread(_adb_drop)
+        await asyncio.to_thread(_update, lambda s: s.update(ip="", auth_cookie="", mac="", adb_ok=False, driver="sony"))
+        await self._take_lock()  # nothing to do any more: release the lock
         return _ok(_t("unpaired"))
 
     # ----- USB wake sources
@@ -870,30 +1423,32 @@ class Plugin:
         return await asyncio.to_thread(_public_usb)
 
     async def usb_set(self, dev_id: str, enabled: bool) -> list:
-        s = _load()
-        s["wake_rules"] = {**s["wake_rules"], dev_id: bool(enabled)}
-        _save(s)
-        await asyncio.to_thread(_usb_set, dev_id, bool(enabled))
+        if isinstance(dev_id, str) and _USB_ID_RE.fullmatch(dev_id):
+            await asyncio.to_thread(_update, lambda s: s.update(wake_rules={**s["wake_rules"], dev_id: bool(enabled)}))
+            await asyncio.to_thread(_usb_set, dev_id, bool(enabled))
         return await asyncio.to_thread(_public_usb)
 
     # ----- sleep / shutdown lock (systemd delay inhibitor)
     async def _take_lock(self):
-        s = _load()
-        need = s["suspend_action"] != "none" or s["shutdown_action"] != "none"
-        if not need:
-            await self._release_lock()
-            return
-        if self._lock and self._lock.returncode is None:
-            return
-        try:
-            self._lock = await asyncio.create_subprocess_exec(
-                *_exe(LOCK_ARGS), stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, env=_env(),
-                preexec_fn=_pdeathsig, start_new_session=True)
-            _log("sleep/shutdown lock taken")
-        except Exception as e:
-            self._lock = None
-            _log(f"could not take lock: {e}")
+        if self._lock_mutex is None:
+            self._lock_mutex = asyncio.Lock()
+        async with self._lock_mutex:
+            s = await asyncio.to_thread(_load)
+            need = _paired(s)  # something to do for a paired TV
+            if not need:
+                await self._release_lock()
+                return
+            if self._lock and self._lock.returncode is None:
+                return
+            try:
+                self._lock = await asyncio.create_subprocess_exec(
+                    *_exe(LOCK_ARGS), stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, env=_env(),
+                    preexec_fn=_pdeathsig, start_new_session=True)
+                _log("sleep/shutdown lock taken")
+            except Exception as e:
+                self._lock = None
+                _log(f"could not take lock: {e}")
 
     async def _release_lock(self):
         p, self._lock = self._lock, None
@@ -903,17 +1458,28 @@ class Plugin:
 
     # ----- resume handling
     async def _handle_resume(self, source: str) -> dict:
-        """Single entry for "the device woke up". Three sources report it: logind (the main one),
-        the Steam UI event and the clock-jump detector (fallbacks). Duplicates within 20 s are dropped."""
+        """Single entry for "the device woke up". Three sources report it: logind (the main one), the Steam UI
+        event and the clock-jump detector (fallbacks). Each real wake-up is handled exactly once: the kernel
+        counts finished suspend attempts, so a source that reports the same count again is a duplicate. Without
+        the counter, duplicates within 20 s are dropped."""
         global _last_resume
-        now = time.time()
-        if now - _last_resume < 20:
+        count = _suspend_count()
+        if count is not None:
+            duplicate = count == self._last_suspends
+            self._last_suspends = count
+        else:
+            now = time.time()
+            duplicate = now - _last_resume < 20
+            if not duplicate:
+                _last_resume = now
+        if duplicate:
             _log(f"resume ({source}) skipped: duplicate")
             return {**_ok(_t("dup")), "skipped": True}
-        _last_resume = now
         self._sleep_fut, self._sleep_ts = None, 0.0  # a new sleep after this resume must not be skipped
         _log(f"resume ({source})")
-        return await _resume_all()
+        res = await _resume_all()
+        _record_result("wake", res)
+        return res
 
     async def on_resume(self) -> dict:  # Steam UI event (fallback path)
         return await self._handle_resume("steam-event")
@@ -927,6 +1493,7 @@ class Plugin:
             _log(f"sleep actions ({source}): tv error: {e}")
             return _fail(str(e))
         _log(f"sleep actions ({source}): tv={tv}")
+        _record_result("sleep", tv)
         return tv
 
     def _sleep_recent(self) -> bool:
@@ -956,6 +1523,7 @@ class Plugin:
                     r = await asyncio.wait_for(asyncio.shield(self._sleep_fut), SLEEP_BUDGET)
                 else:
                     r = await asyncio.wait_for(asyncio.to_thread(_tv_shutdown, _load(), typ), SLEEP_BUDGET)
+                    _record_result("shutdown", r)
                 _log(f"{kind}: {r}")
             except asyncio.TimeoutError:
                 _log(f"{kind}: actions timed out")
@@ -964,9 +1532,7 @@ class Plugin:
             await self._release_lock()  # let logind continue
         elif kind == "sleep":
             await self._take_lock()
-            r = await self._handle_resume("logind")
-            if not r.get("skipped"):
-                await self._emit(r)
+            await self._handle_resume("logind")
 
     async def _handle_signal(self, member: str, lines):
         text = "".join(lines)
@@ -1057,9 +1623,7 @@ class Plugin:
             if slept > 8:
                 _log(f"sleep detected (~{slept:.0f}s)")
                 try:
-                    r = await self._handle_resume("sleep-detector")
-                    if not r.get("skipped"):
-                        await self._emit(r)
+                    await self._handle_resume("sleep-detector")
                 except Exception as e:
                     _log(f"resume handling failed: {e}")
 
@@ -1068,9 +1632,12 @@ class Plugin:
         # No fixed delay: _tv_fast keeps retrying until the network and the TV answer (up to 45 s)
         r = await _resume_all()
         _log(f"startup: {r}")
+        _record_result("wake", r)
 
     async def _main(self):
         _log(f"NetCEC loaded (root={os.geteuid() == 0})")
+        self._last_suspends = _suspend_count()
+        _log("resume duplicates are told apart by: " + ("the kernel suspend counter" if self._last_suspends is not None else "a 20 s timer"))
         loop = asyncio.get_event_loop()
         self._tasks = [loop.create_task(c) for c in
                        (self._startup(), self._watch_sleep(), self._logind_loop())]
@@ -1082,5 +1649,6 @@ class Plugin:
         for t in list(self._tasks) + list(self._bg):
             t.cancel()
         _kill_group(self._mon)
+        _adb_drop()
         await self._release_lock()
         _log("NetCEC unloaded")
