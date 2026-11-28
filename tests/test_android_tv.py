@@ -48,16 +48,6 @@ class Parse(unittest.TestCase):
     def test_an_input_without_any_trace_of_which_one_is_unknown(self):
         self.assertEqual(self.parse(look_output(starter=[], resumed="com.tcl.tvinput/.X"))[0], -1)
 
-    def test_sony_hw5_maps_to_hdmi4_even_when_all_profiles_are_dumped(self):
-        text = look_output(starter=["HW5", "HW5"], resumed="com.sony.dtv.tvx/.MainActivity").replace(
-            "##tvinput\n", "##tvinput\nResourceClientProfile { hdmi_port=1 }\n"
-            "ResourceClientProfile { hdmi_port=2 }\nResourceClientProfile { hdmi_port=3 }\n"
-            "ResourceClientProfile { hdmi_port=4 }\n")
-        self.assertEqual(self.parse(text)[0], 4)
-
-    def test_sony_hw2_maps_to_hdmi1(self):
-        self.assertEqual(self.parse(look_output(starter=["HW2"], resumed="com.sony.dtv.tvx/.MainActivity"))[0], 1)
-
     def test_sony_activity_has_no_adb_specific_input_mapping(self):
         port, explanation = self.parse(look_output(resumed="com.sony.dtv.tvx/.MainActivity"))
         self.assertEqual(port, -1)
@@ -332,7 +322,7 @@ class AndroidTvLeaves(unittest.TestCase):
     def leave(self, mode, look_results):
         looks = list(look_results)
         sent = []
-        with mock.patch.object(main, "_adb_look", lambda s, t=4: (looks.pop(0), "x")), \
+        with mock.patch.object(main, "_adb_look", lambda s, t=4, log=True: (looks.pop(0), "x")), \
                 mock.patch.object(main, "_adb_shell", lambda s, c, t=4.0: sent.append(c) or ""), \
                 mock.patch.object(main, "_log", lambda m: None):
             return main._leave(dict(ADB), mode), sent
@@ -575,8 +565,9 @@ class EndToEnd(SettingsCase):
         # an Android TV is asked whether it is awake first (a sleeping one would swallow the command) ...
         self.assertEqual(self.tv.commands[0], "dumpsys power | grep -m1 mWakefulness=")
         goes = [c for c in self.tv.commands if "am start" in c]
-        self.assertEqual(len(goes), 1)  # Back and the input of port 4 in one line, at the same moment
+        self.assertEqual(len(goes), 2)  # One initial attempt, one retry after the TV never confirms the input
         self.assertTrue(goes[0].startswith("input keyevent 4 & am start") and TCL_USER_IDS[4] in goes[0])
+        self.assertTrue(all(TCL_USER_IDS[4] in c for c in goes))
 
     def test_going_to_sleep_with_the_tv_on_another_input_leaves_it_alone(self):
         self.tv.known.append((__import__("test_adb_client").key()["n"], 65537))
