@@ -103,6 +103,16 @@ class Discover(unittest.TestCase):
         self.assertIsNone(main._fetch_description("10.0.0.5", self.srv.url("/dmr.xml")))
 
 
+class DescriptionRedirect(unittest.TestCase):
+    def test_only_http_redirects_to_the_responder_are_allowed(self):
+        handler = main._DescriptionRedirect()
+        request = main.urllib.request.Request("http://192.0.2.10/device.xml")
+        for target in ("http://192.0.2.20/device.xml", "https://192.0.2.10/device.xml"):
+            self.assertIsNone(handler.redirect_request(request, None, 302, "", {}, target))
+        target = "http://192.0.2.10/description.xml"
+        self.assertEqual(handler.redirect_request(request, None, 302, "", {}, target).full_url, target)
+
+
 class SsdpSocket(unittest.TestCase):
     """The real UDP code against a responder on the loopback interface."""
 

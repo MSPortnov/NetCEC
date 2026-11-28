@@ -78,6 +78,14 @@ class Leave(unittest.TestCase):
     def test_a_failed_command_is_reported(self):
         self.assertFalse(Recorder(looks=[2], command_fails=True).leave("off")["ok"])
 
+    def test_a_late_input_confirmation_does_not_trigger_an_action(self):
+        with mock.patch.object(main.time, "monotonic", side_effect=[0, 0, 0, 5, 5]), \
+                mock.patch.object(main, "_current_port", return_value=2), \
+                mock.patch.object(main, "_rest") as send:
+            result = main._leave(S, "off", deadline=4)
+        self.assertFalse(result["ok"])
+        send.assert_not_called()
+
 
 class SleepAndShutdown(unittest.TestCase):
     """Sleep and shutdown offer the same two actions; they always do one of them."""
@@ -95,7 +103,7 @@ class SleepAndShutdown(unittest.TestCase):
 
     def test_shutdown_actions(self):
         for choice in main.LEAVE_ACTIONS:
-            _, leave = self.call(main._tv_shutdown, {"shutdown_action": choice}, "poweroff")
+            _, leave = self.call(main._tv_shutdown, {"shutdown_action": choice}, "power-off")
             leave.assert_called_once()
             self.assertEqual(leave.call_args.args[1:], (choice,), choice)
 
@@ -104,6 +112,25 @@ class SleepAndShutdown(unittest.TestCase):
             result, leave = self.call(main._tv_shutdown, {"shutdown_action": choice}, "reboot")
             self.assertTrue(result["ok"])
             leave.assert_not_called()
+
+    def test_shutdown_without_metadata_requires_a_confirmed_poweroff_job(self):
+        cases = [
+            (1, "Timed out", False),
+            (1, "42 poweroff.target start waiting", False),
+            (0, "42 shutdown.target start waiting", False),
+            (0, "42 poweroff.target stop waiting", False),
+            (0, "42 poweroff.target start waiting\n43 reboot.target start waiting", False),
+            (0, "42 poweroff.target start waiting", True),
+        ]
+        for rc, jobs, should_act in cases:
+            with self.subTest(rc=rc, jobs=jobs), mock.patch.object(main, "_run", return_value=(rc, jobs)):
+                _, leave = self.call(main._tv_shutdown, {})
+                self.assertEqual(leave.called, should_act)
+
+    def test_an_unknown_shutdown_type_does_not_touch_the_tv(self):
+        result, leave = self.call(main._tv_shutdown, {}, "unknown")
+        self.assertFalse(result["ok"])
+        leave.assert_not_called()
 
     def test_no_tv_configured_means_nothing_to_do(self):
         for fn, args in ((main._tv_suspend, ()), (main._tv_shutdown, ("poweroff",))):

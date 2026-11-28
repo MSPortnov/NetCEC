@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import unittest
 from unittest import mock
 
@@ -72,6 +73,47 @@ class SuspendCounter(unittest.TestCase):
     def test_unavailable_is_none(self):
         with mock.patch("builtins.open", side_effect=FileNotFoundError):
             self.assertIsNone(main._suspend_count())
+
+
+class CancelWake(SettingsCase):
+    def test_sleep_and_poweroff_cancel_a_wake_that_is_waiting_for_the_tv(self):
+        main._save({**main.DEFAULTS, "ip": "192.0.2.4", "driver": "adb", "adb_ok": True, "hdmi_port": 4})
+
+        async def scenario(departure):
+            plugin = main.Plugin()
+            reading = threading.Event()
+            release = threading.Event()
+
+            def power_state(_settings):
+                reading.set()
+                if not release.wait(2):
+                    raise AssertionError("the wake operation was not released")
+                return "active"
+
+            with mock.patch.object(main, "_t_power_state", side_effect=power_state), \
+                    mock.patch.object(main, "_t_current_port", return_value=4), \
+                    mock.patch.object(main, "_t_off") as off, \
+                    mock.patch.object(main, "_t_go") as go:
+                wake = asyncio.create_task(plugin._handle_resume("test"))
+                try:
+                    self.assertTrue(await asyncio.to_thread(reading.wait, 2))
+                    if departure == "sleep":
+                        await plugin.on_suspend()
+                    else:
+                        await plugin._handle_signal("PrepareForShutdownWithMetadata", [
+                            "boolean true\n", 'string "type"\n', 'variant string "power-off"\n',
+                        ])
+                        await plugin._handle_signal("PrepareForShutdown", ["boolean true\n"])
+                        self.assertIsNone(plugin._plain_task)
+                finally:
+                    release.set()
+                    await wake
+                off.assert_called_once()
+                go.assert_not_called()
+
+        for departure in ("sleep", "shutdown"):
+            with self.subTest(departure=departure), mock.patch.object(main, "_suspend_count", return_value=1):
+                asyncio.run(scenario(departure))
 
 
 class SleepDetector(SettingsCase):

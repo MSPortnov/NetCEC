@@ -3,6 +3,7 @@ import asyncio
 import os
 import re
 import struct
+import threading
 import time
 
 
@@ -26,12 +27,10 @@ class Plugin:
     _lock_mutex = None  # makes taking the lock atomic (two quick calls must not start two)
     _mon = None    # dbus-monitor process (logind signals)
     _tasks = ()
-    _bg = set()
     _sleep_fut = None   # sleep actions of the current sleep (shared by the Steam hook and logind)
     _sleep_ts = 0.0
     _last_suspends = None  # the kernel's count of finished suspend attempts at the last handled resume
     _plain_task = None
-    _meta_ts = 0.0
     _ps_files = {}  # read-only event-device file descriptors; observing does not grab the controller
     _ps_labels = {}
     _ps_seen_inputs = []
@@ -41,6 +40,11 @@ class Plugin:
     _ps_last_action = 0.0
     _ps_debug_remaining = 0
     _ps_startup_done = False
+
+    def __init__(self):
+        self._bg = set()
+        self._wake_cancelled = threading.Event()
+        self._shutting_down = False
 
     def _spawn(self, coro):
         t = asyncio.get_event_loop().create_task(coro)
@@ -90,7 +94,10 @@ class Plugin:
         return await asyncio.to_thread(self._runtime._discover)
 
     async def pair_start(self) -> dict:
-        return await asyncio.to_thread(self._runtime._pair_start, self._runtime._load())
+        result = await asyncio.to_thread(self._runtime._pair_start, self._runtime._load())
+        if result.get("ok"):
+            await self._take_lock()
+        return result
 
     async def train_hdmi(self) -> dict:
         return await asyncio.to_thread(self._runtime._adb_train_inputs, self._runtime._load())
@@ -155,6 +162,8 @@ class Plugin:
         event and the clock-jump detector (fallbacks). Each real wake-up is handled exactly once: the kernel
         counts finished suspend attempts, so a source that reports the same count again is a duplicate. Without
         the counter, duplicates within 20 s are dropped."""
+        if self._shutting_down:
+            return {**self._runtime._ok(self._runtime._t("nothing")), "skipped": True}
         count = self._runtime._suspend_count()
         if count is not None:
             duplicate = count == self._last_suspends
@@ -168,28 +177,36 @@ class Plugin:
             self._runtime._log(f"resume ({source}) skipped: duplicate")
             return {**self._runtime._ok(self._runtime._t("dup")), "skipped": True}
         self._sleep_fut, self._sleep_ts = None, 0.0  # a new sleep after this resume must not be skipped
+        self._wake_cancelled.set()
+        self._wake_cancelled = threading.Event()
         self._runtime._log(f"resume ({source})")
-        res = await self._runtime._resume_all()
+        res = await self._runtime._resume_all(self._wake_cancelled)
         self._runtime._record_result("wake", res)
         return res
 
     async def on_resume(self) -> dict:  # Steam UI event (fallback path)
         return await self._handle_resume("steam-event")
 
-    async def _sleep_run(self, source: str):
+    async def _sleep_run(self, source: str, deadline: float):
         """Run configured TV actions before sleep."""
         s = self._runtime._load()
         try:
-            tv = await asyncio.to_thread(self._runtime._tv_suspend, s)
+            tv = await asyncio.to_thread(self._runtime._tv_suspend, s, deadline=deadline)
         except Exception as e:
             self._runtime._log(f"sleep actions ({source}): tv error: {e}")
-            return _fail(str(e))
+            return self._runtime._fail(str(e))
         self._runtime._log(f"sleep actions ({source}): tv={tv}")
         self._runtime._record_result("sleep", tv)
         return tv
 
     def _sleep_recent(self) -> bool:
-        return self._sleep_fut is not None and time.time() - self._sleep_ts < 10
+        return self._sleep_fut is not None and time.monotonic() - self._sleep_ts < 10
+
+    def _start_sleep(self, source: str):
+        self._wake_cancelled.set()
+        self._sleep_ts = time.monotonic()
+        deadline = self._sleep_ts + self._runtime.SLEEP_BUDGET
+        self._sleep_fut = asyncio.ensure_future(self._sleep_run(source, deadline))
 
     async def on_suspend(self, source: str = "steam-event") -> dict:
         """Steam UI announces the sleep BEFORE logind: the network is still up here, whereas
@@ -197,8 +214,7 @@ class Plugin:
         if self._sleep_recent():
             self._runtime._log(f"suspend ({source}): skipped, already handled")
             return {**self._runtime._ok(self._runtime._t("dup")), "skipped": True}
-        self._sleep_ts = time.time()
-        self._sleep_fut = asyncio.ensure_future(self._sleep_run(source))
+        self._start_sleep(source)
         r = await self._sleep_fut
         return r or self._runtime._ok(self._runtime._t("nothing"))
 
@@ -210,21 +226,31 @@ class Plugin:
                     if self._sleep_recent():
                         self._runtime._log("sleep: actions already started by a Steam UI hook, waiting for them")
                     else:
-                        self._sleep_ts = time.time()
-                        self._sleep_fut = asyncio.ensure_future(self._sleep_run("logind"))
-                    r = await asyncio.wait_for(asyncio.shield(self._sleep_fut), self._runtime.SLEEP_BUDGET)
+                        self._start_sleep("logind")
+                    remaining = self._sleep_ts + self._runtime.SLEEP_BUDGET - time.monotonic()
+                    r = await asyncio.wait_for(asyncio.shield(self._sleep_fut), remaining)
                 else:
-                    r = await asyncio.wait_for(asyncio.to_thread(self._runtime._tv_shutdown, self._runtime._load(), typ), self._runtime.SLEEP_BUDGET)
+                    self._shutting_down = True
+                    self._wake_cancelled.set()
+                    deadline = time.monotonic() + self._runtime.SLEEP_BUDGET
+                    action = asyncio.to_thread(self._runtime._tv_shutdown, self._runtime._load(), typ, deadline=deadline)
+                    r = await asyncio.wait_for(action, deadline - time.monotonic())
                     self._runtime._record_result("shutdown", r)
                 self._runtime._log(f"{kind}: {r}")
             except asyncio.TimeoutError:
                 self._runtime._log(f"{kind}: actions timed out")
             except Exception as e:
                 self._runtime._log(f"{kind}: failed: {e}")
-            await self._release_lock()  # let logind continue
+            finally:
+                await self._release_lock()  # let logind continue
         elif kind == "sleep":
             await self._take_lock()
-            await self._handle_resume("logind")
+            self._spawn(self._handle_resume("logind"))
+        elif self._shutting_down:
+            self._shutting_down = False
+            if not self._sleep_recent():
+                self._wake_cancelled = threading.Event()
+            await self._take_lock()
 
     async def _handle_signal(self, member: str, lines):
         text = "".join(lines)
@@ -239,19 +265,22 @@ class Plugin:
             typ = tm.group(1) if tm else None
             if typ is None:
                 self._runtime._log(f"shutdown metadata not parsed: {text!r}")
-            self._meta_ts = time.time()
             if self._plain_task:
                 self._plain_task.cancel()
-            if start:
-                await self._on_logind("shutdown", True, typ)
-        elif member == "PrepareForShutdown" and start:
-            # systemd >= 257 follows with ...WithMetadata (reboot vs poweroff); wait briefly for it
+            await self._on_logind("shutdown", start, typ)
+        elif member == "PrepareForShutdown" and not start:
+            if self._plain_task:
+                self._plain_task.cancel()
+            await self._on_logind("shutdown", False)
+        elif member == "PrepareForShutdown" and not self._shutting_down:
+            # logind sends ...WithMetadata first when supported, then this compatibility signal.
+            self._shutting_down = True
+            self._wake_cancelled.set()
             self._plain_task = self._spawn(self._plain_shutdown())
 
     async def _plain_shutdown(self):
         await asyncio.sleep(0.8)
-        if time.time() - self._meta_ts > 2:
-            await self._on_logind("shutdown", True, None)
+        await self._on_logind("shutdown", True, None)
 
     async def _logind_loop(self):
         """Follow logind's PrepareForSleep / PrepareForShutdown(WithMetadata) via dbus-monitor."""
@@ -431,6 +460,9 @@ class Plugin:
 
     async def _on_ps_press(self):
         """Return to the configured HDMI input after PS, but only while the TV is on another input."""
+        cancelled = self._wake_cancelled
+        if cancelled.is_set():
+            return
         now = time.monotonic()
         if now - self._ps_last_action < 3.0:
             return
@@ -441,9 +473,9 @@ class Plugin:
         target = int(s["hdmi_port"])
         try:
             current = await asyncio.to_thread(self._runtime._t_current_port, s, timeout=2.0)
-            if current is None or current < 0 or current == target:
+            if cancelled.is_set() or current is None or current < 0 or current == target:
                 return
-            result = await asyncio.to_thread(self._runtime._tv_fast, s)
+            result = await asyncio.to_thread(self._runtime._tv_fast, s, cancelled)
             self._runtime._log(f"PS button: switch to HDMI {target}: {result}")
             self._runtime._record_result("wake", result)
         except Exception as e:
@@ -589,7 +621,7 @@ class Plugin:
     async def _startup(self):
         # No fixed delay: _tv_fast keeps retrying until the network and the TV answer (up to 45 s)
         try:
-            r = await self._runtime._resume_all()
+            r = await self._runtime._resume_all(self._wake_cancelled)
             self._runtime._log(f"startup: {r}")
             self._runtime._record_result("wake", r)
         finally:

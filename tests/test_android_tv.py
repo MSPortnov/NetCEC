@@ -88,7 +88,7 @@ class Shell:
         self.look = look if look is not None else look_output()
         self.fail_on = fail_on
 
-    def __call__(self, s, command, timeout=4.0):
+    def __call__(self, s, command, timeout=4.0, *, deadline=None, cancelled=None):
         self.commands.append(command)
         if self.fail_on and self.fail_on in command:
             raise OSError("boom")
@@ -132,7 +132,7 @@ class Commands(unittest.TestCase):
 
     def test_an_error_from_the_tv_is_an_error(self):
         sh = Shell()
-        sh.__class__ = type("Bad", (Shell,), {"__call__": lambda self, s, c, t=4.0: (
+        sh.__class__ = type("Bad", (Shell,), {"__call__": lambda self, s, c, t=4.0, *, cancelled=None: (
             "Error: Activity not started, unable to resolve Intent\n" if c.startswith("am start")
             else Shell.__call__(self, s, c, t))})
         with mock.patch.object(main, "_adb_shell", sh), self.assertRaises(RuntimeError):
@@ -152,7 +152,7 @@ class Commands(unittest.TestCase):
 
     def test_an_error_in_the_combined_line_is_still_an_error(self):
         sh = Shell()
-        sh.__class__ = type("Bad", (Shell,), {"__call__": lambda self, s, c, t=4.0: (
+        sh.__class__ = type("Bad", (Shell,), {"__call__": lambda self, s, c, t=4.0, *, cancelled=None: (
             "Error: Activity not started\n" if "am start" in c else Shell.__call__(self, s, c, t))})
         with mock.patch.object(main, "_adb_shell", sh), self.assertRaises(RuntimeError):
             main._adb_go(ADB, 1, True)
@@ -228,7 +228,7 @@ class FakeAdbTv:
         self.clock, self.asleep, self.wake_delay, self.port, self.reachable = FakeClock(), asleep, wake_delay, port, reachable
         self.wake_at, self.commands = None, []
 
-    def shell(self, s, command, timeout=4.0):
+    def shell(self, s, command, timeout=4.0, *, cancelled=None):
         if not self.reachable:
             raise OSError("unreachable")
         if self.asleep and self.wake_at is not None and self.clock.now >= self.wake_at:
@@ -323,7 +323,7 @@ class AndroidTvLeaves(unittest.TestCase):
         looks = list(look_results)
         sent = []
         with mock.patch.object(main, "_adb_look", lambda s, t=4, log=True: (looks.pop(0), "x")), \
-                mock.patch.object(main, "_adb_shell", lambda s, c, t=4.0: sent.append(c) or ""), \
+                mock.patch.object(main, "_adb_shell", lambda s, c, t=4.0, *, deadline=None: sent.append(c) or ""), \
                 mock.patch.object(main, "_log", lambda m: None):
             return main._leave(dict(ADB), mode), sent
 
@@ -347,6 +347,35 @@ class AndroidTvLeaves(unittest.TestCase):
         result, sent = self.leave("off", [None, None])
         self.assertEqual(sent, [])
         self.assertTrue(result["ok"])
+
+
+class Training(SettingsCase):
+    def setUp(self):
+        super().setUp()
+        main._save({**ADB, "adb_inputs": {"2": "HW2", "4": "HW40"}})
+
+    def train(self, readings):
+        with mock.patch.object(main, "_adb_power_state", return_value="active"), \
+                mock.patch.object(main, "_t_home") as home, \
+                mock.patch.object(main, "_adb_shell", side_effect=readings), \
+                mock.patch.object(main, "_adb_switch") as switch, \
+                mock.patch.object(main.time, "sleep"):
+            result = asyncio.run(main.Plugin().train_hdmi())
+            home.assert_called_once()
+            switch.assert_called_once()
+            self.assertEqual(switch.call_args.args[1], 4)
+            return result
+
+    def test_only_the_selected_input_is_learned(self):
+        hdmi = look_output(starter=["HW444"], resumed="com.tcl.tvinput/.PlayActivity")
+        self.assertTrue(self.train([look_output(), hdmi, hdmi])["ok"])
+        learned = main._load()["adb_inputs"]
+        self.assertEqual(learned, {"2": "HW2", "4": "HW444"})
+        self.assertEqual(main._adb_parse_look(hdmi, {"HW444": 3}, learned)[0], 4)
+
+    def test_timeout_after_home_still_returns_to_the_selected_input(self):
+        self.assertFalse(self.train([TimeoutError("no reading")])["ok"])
+        self.assertEqual(main._load()["adb_inputs"], {"2": "HW2", "4": "HW40"})
 
 
 class Pairing(SettingsCase):
@@ -375,12 +404,27 @@ class Pairing(SettingsCase):
 
     def test_the_user_accepts_the_key_on_the_tv(self):
         waits = []
+        main._save({**ADB, "adb_ok": False})
+        plugin = main.Plugin()
         with mock.patch.object(main.netcec_adb, "Connection", self.connection_class(lambda c: waits.append(c.approval_wait))):
-            r = main._adb_pair({**ADB, "adb_ok": False})
+            with mock.patch.object(plugin, "_take_lock", new_callable=mock.AsyncMock) as take_lock:
+                r = asyncio.run(plugin.pair_start())
+                take_lock.assert_awaited_once()
         self.assertTrue(r["ok"])
         self.assertEqual(waits, [main.ADB_APPROVAL_WAIT])  # it waited for the user
         s = main._load()
         self.assertEqual((s["driver"], s["adb_ok"]), ("adb", True))
+
+    def test_late_approval_cannot_pair_a_different_address(self):
+        main._save({**ADB, "adb_ok": False})
+
+        def choose_another_tv(_connection):
+            main._update(lambda s: s.update(ip="192.168.0.94"))
+
+        with mock.patch.object(main.netcec_adb, "Connection", self.connection_class(choose_another_tv)):
+            result = asyncio.run(main.Plugin().pair_start())
+        self.assertFalse(result["ok"])
+        self.assertFalse(main._paired(main._load()))
 
     def test_nobody_accepts(self):
         def refuse(c):
@@ -406,13 +450,16 @@ class Pairing(SettingsCase):
 
     def test_an_address_that_is_no_sony_but_has_adb_is_paired_as_an_android_tv(self):
         s = {**main.DEFAULTS, "ip": "192.168.0.93"}
+        main._save(s)
         with mock.patch.object(main, "_register", side_effect=OSError("refused")), \
                 mock.patch.object(main, "_port_open", return_value=True), \
-                mock.patch.object(main, "_adb_pair", return_value={"ok": True, "message": "paired"}) as pair:
+                mock.patch.object(main, "_discover", return_value=[]), \
+                mock.patch.object(main, "_adb_brand", return_value="tcl"), \
+                mock.patch.object(main.netcec_adb, "Connection", self.connection_class(lambda c: None)):
             r = main._pair_start(s)
         self.assertTrue(r["ok"])
-        self.assertEqual(s["driver"], "adb")
-        pair.assert_called_once()
+        self.assertEqual(main._load()["driver"], "adb")
+        self.assertTrue(main._paired(main._load()))
 
     def test_an_address_that_answers_nothing_is_just_an_error(self):
         s = {**main.DEFAULTS, "ip": "192.168.0.93"}
@@ -551,6 +598,7 @@ class EndToEnd(SettingsCase):
             p.start()
             self.addCleanup(p.stop)
         self.settings = {**main.DEFAULTS, "ip": "127.0.0.1", "driver": "adb", "hdmi_port": 4, "wake_tv": True}
+        main._save(self.settings)
 
     def test_pairing_then_waking_up(self):
         threading.Timer(0.3, self.tv.approve.set).start()  # the user presses "Always allow" on the TV

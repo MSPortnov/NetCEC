@@ -68,8 +68,9 @@ The script is short, [read it here](install.sh) before you run it.
      **Normal** and turn on **Remote start**.
    - *Android TV (TCL and others):* turn on Developer options, then **Network debugging** (USB debugging).
 2. **In NetCEC:** with the TV turned on, press **Find TV on the network** (the plugin also searches by itself
-   the first time you open it) and pick your TV from the list. If it is not found, type the TV's IP address
-   by hand (you can find it in the TV's network settings).
+   the first time you open it) and pick your TV from the list. If there is only one result, it is selected
+   automatically. If the search finds nothing, enter the IP address from the TV's network settings. Once
+   a TV is selected, the search button becomes the pairing button. Clear the IP field to search again.
 3. - *Sony:* press **Show PIN on TV**. A code appears on the TV screen. Type it into **PIN shown on TV** and
      press **Confirm PIN**.
    - *Android TV:* press **Connect**. The TV asks "Allow USB debugging?": choose **Always allow** (the plugin
@@ -78,8 +79,7 @@ The script is short, [read it here](install.sh) before you run it.
    over ADB; for Sony nothing changes.)
 5. Pick the **HDMI port** the box is plugged into. Then, in the three sections *On wake-up*, *When going to sleep*
    and *When shutting down*, choose what the TV should do. Under every choice the plugin shows in one sentence
-   what it will do. For ADB, press **Teach the plugin to detect HDMI ports**: the TV visits each input and returns
-   to the selected port.
+   what it will do. For ADB, press **Learn HDMI** for the port you selected.
 
 The pairing renews itself every time it is used. If it gets lost (for example you removed the device on the
 TV), the status will ask you to pair again.
@@ -88,9 +88,9 @@ TV), the status will ask you to pair again.
 
 - Sony automatically uses Sony IP control; discovered Android/Google TVs use ADB. ADB network debugging must
   be available on port 5555; the newer Wireless debugging mode with a separate pairing port is not supported yet.
-- On a paired Android/Google TV, press **Teach the plugin to detect HDMI ports**. The TV visits HDMI 1–4 and
-  returns to the selected port. The plugin learns only inputs it can read consistently over ADB. Some models may not
-  expose their current HDMI input; those inputs cannot be learned.
+- On a paired Android/Google TV, press **Learn HDMI 4** if you selected HDMI 4, for example. The TV opens its home
+  screen and then switches directly to the selected port. The plugin saves the input ID when two consecutive readings
+  agree. Some models do not expose their current HDMI input over ADB.
 - On wake, the plugin switches to the selected HDMI. After learning, it also checks whether the TV actually shows
   that input; without confirmation it reports that the command was sent but not confirmed.
 
@@ -149,6 +149,7 @@ No Sony Bravia at hand? You can still check that the plugin loads and works:
 - Sleep and shutdown: the backend follows systemd-logind (`PrepareForSleep` / `PrepareForShutdown`
   via `dbus-monitor`) and holds a short delay lock (`systemd-inhibit`, a few seconds at most) so the TV can
   be turned off before the network goes down. Steam UI events and a clock-jump detector are used as fallbacks.
+  A new sleep or shutdown cancels pending wake commands. For shutdown, NetCEC needs a confirmed power-off or halt.
   Each real wake-up is handled exactly once: the kernel counts finished suspend attempts
   (`/sys/power/suspend_stats/success` + `fail`), and a source reporting the same count again is a duplicate
   (a 20 s timer is the fallback if the counter is missing; the log says which one is used).

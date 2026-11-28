@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { callable, definePlugin } from "@decky/api";
 import {
@@ -65,15 +65,16 @@ const STR: Record<Lang, Record<string, string>> = {
     found_none_hint: "Turn the TV on and check that it is on the same network, or enter its IP address below.",
     tv_list: "Found TVs",
     pick_tv: "Choose a TV",
-    hint_tv: "Turn the TV on and press «Find TV» (or enter its IP address). On the TV: IP control > Authentication = Normal, enable Remote start. Then show the PIN and enter it below.",
+    hint_tv: "On the TV, set IP control authentication to Normal and enable Remote start. Request the PIN and enter it below.",
     hint_tv_adb: "On the TV: Developer options > turn on Network debugging (USB debugging). Then press Connect: the TV asks to allow debugging, choose \u201cAlways allow\u201d.",
     adb_connect: "Connect",
-    train_hdmi: "Teach the plugin to detect HDMI ports",
-    train_hint: "The TV will visit HDMI 1–4, then return to the selected port.",
-    trained_ports: "HDMI input detection has been learned.",
+    train_hdmi: "Learn HDMI {n}",
+    train_hint: "The TV will go to Home, then switch to HDMI {n}.",
+    trained_port: "HDMI {n} detection is set up.",
     training: "Teaching input detection…",
     kind_adb: "Android TV",
     pin_show: "Show PIN on TV",
+    not_configured: "Not configured",
     not_paired: "Not paired",
     pin_label: "PIN shown on TV",
     pin_confirm: "Confirm PIN",
@@ -121,15 +122,16 @@ const STR: Record<Lang, Record<string, string>> = {
     found_none_hint: "Включите ТВ и проверьте, что он в одной сети с приставкой, или введите его IP-адрес ниже.",
     tv_list: "Найденные ТВ",
     pick_tv: "Выберите ТВ",
-    hint_tv: "Включите ТВ и нажмите «Найти ТВ» (или введите IP-адрес). На ТВ: IP-управление → Аутентификация = Normal, включите «Remote start». Затем покажите PIN и введите его ниже.",
+    hint_tv: "На ТВ установите аутентификацию IP-управления «Normal» и включите «Remote start». Запросите PIN и введите его ниже.",
     hint_tv_adb: "На ТВ: «Для разработчиков» → включите «Отладка по сети» (отладка по USB). Затем нажмите «Подключить»: ТВ спросит разрешение на отладку, выберите «Всегда разрешать».",
     adb_connect: "Подключить",
-    train_hdmi: "Обучить плагин определять HDMI-порт?",
-    train_hint: "ТВ по очереди переключится на HDMI 1–4, затем вернётся на выбранный порт.",
-    trained_ports: "Определение HDMI-входов обучено.",
+    train_hdmi: "Обучить определению HDMI {n}",
+    train_hint: "ТВ откроет главный экран, затем переключится на HDMI {n}.",
+    trained_port: "Определение HDMI {n} настроено.",
     training: "Обучаю определять входы…",
     kind_adb: "Android TV",
     pin_show: "Показать PIN на ТВ",
+    not_configured: "Не настроено",
     not_paired: "Не сопряжено",
     pin_label: "PIN с экрана ТВ",
     pin_confirm: "Подтвердить PIN",
@@ -249,11 +251,13 @@ function Content() {
   const [usb, setUsb] = useState<UsbDev[]>([]);
   const [info, setInfo] = useState<Info>({ root: true, monitor: false, lock: false });
   const [busy, setBusy] = useState(false);
+  const [savingHdmi, setSavingHdmi] = useState(false);
   const [pin, setPin] = useState("");
   const [confirmUnpair, setConfirmUnpair] = useState(false);
   const [found, setFound] = useState<TvFound[]>([]);
   const [searching, setSearching] = useState(false);
   const [searched, setSearched] = useState(false);
+  const tvSaved = useRef(Promise.resolve());
 
   const lang: Lang = s ? resolveLang(s.lang_pref) : detectLang();
   const t = (k: string, n?: number) => tr(lang, k, n);
@@ -283,16 +287,31 @@ function Content() {
       .catch(() => {});
   const refreshInfo = () => getInfo().then(setInfo);
 
+  const selectTv = (ip: string, driver: string) => {
+    const selection = { ip, driver };
+    const save = tvSaved.current.catch(() => {}).then(() => setSettings(selection));
+    tvSaved.current = save;
+    setS((current) => current && { ...current, ...selection });
+    setPin("");
+    setNote("");
+    save.catch((error) => {
+      if (tvSaved.current === save) {
+        setNote(String(error));
+        refresh();
+      }
+    });
+    return save;
+  };
+
   // Looks for supported TVs on the network; a single result is selected automatically.
-  const discover = async (currentIp: string) => {
+  const discover = async () => {
+    const selectionBeforeSearch = tvSaved.current;
     setSearching(true);
     try {
       const list = await findTvs();
       setFound(list);
-      if (list.length === 1 && !currentIp) {
-        const selection = { ip: list[0].ip, driver: list[0].kind === "adb" ? "adb" : "sony" };
-        await setSettings(selection);
-        setS((cur) => (cur ? { ...cur, ...selection } : cur));
+      if (list.length === 1 && tvSaved.current === selectionBeforeSearch) {
+        await selectTv(list[0].ip, list[0].kind === "adb" ? "adb" : "sony");
       }
     } catch (e) {
       setFound([]);
@@ -314,7 +333,7 @@ function Content() {
       refreshStatus();
       refreshInfo();
       usbList().then(setUsb);
-      if (!st.paired && !st.ip) discover(""); // first start: look for the TV right away
+      if (!st.paired && !st.ip) discover(); // first start: look for the TV right away
     })();
   }, []);
 
@@ -344,7 +363,7 @@ function Content() {
   const update = (patch: Partial<Settings>) => {
     restoreUntil = Date.now() + 2000;
     setS({ ...s, ...patch });
-    setSettings(patch).then(refreshInfo);
+    return setSettings(patch).then(refreshInfo);
   };
 
   // The result of an action (pairing, a check) is shown in the panel; there are no pop-up notifications
@@ -354,22 +373,26 @@ function Content() {
       const r = await fn();
       setNote(r.ok ? "" : r.message);
       refreshEvents();
+    } catch (error) {
+      setNote(String(error));
     } finally {
       restoreUntil = Date.now() + 2000;
       setBusy(false);
       refresh();
       refreshStatus();
+      refreshInfo();
     }
   };
 
   const paired = s.paired;
-  const adbTrainingComplete = [1, 2, 3, 4].every((port) => s.adb_trained_ports.includes(port));
+  const hasTv = Boolean(s.ip);
+  const hdmiTrained = s.adb_trained_ports.includes(s.hdmi_port);
 
   return (
     <>
       <PanelSection title={t("sec_tv")}>
         <PanelSectionRow>
-          <div style={{ fontSize: 13 }}>{status}</div>
+          <div style={{ fontSize: 13 }}>{paired ? status : t(hasTv ? "not_paired" : "not_configured")}</div>
         </PanelSectionRow>
         {note && (
           <PanelSectionRow>
@@ -402,14 +425,21 @@ function Content() {
                 layout="below"
                 disabled={busy || searching}
                 description={
-                  searching ? t("searching") : searched ? (found.length ? t("found_n", found.length) : t("found_none")) : undefined
+                  searching
+                    ? t("searching")
+                    : hasTv
+                      ? s.ip
+                      : searched ? t(found.length ? "found_n" : "found_none", found.length) : undefined
                 }
-                onClick={() => discover(s.ip)}
+                onClick={() => hasTv ? run(async () => {
+                  await tvSaved.current;
+                  return pairStart();
+                }) : discover()}
               >
-                {t("find_tv")}
+                {t(hasTv ? (s.driver === "adb" ? "adb_connect" : "pin_show") : "find_tv")}
               </ButtonItem>
             </Row>
-            {searched && !searching && found.length === 0 && (
+            {searched && !searching && !hasTv && found.length === 0 && (
               <PanelSectionRow>
                 <div style={{ fontSize: 12, opacity: 0.7 }}>{t("found_none_hint")}</div>
               </PanelSectionRow>
@@ -420,9 +450,10 @@ function Content() {
                   label={t("tv_list")}
                   rgOptions={tvOptions}
                   selectedOption={found.some((f) => f.ip === s.ip) ? s.ip : ""}
+                  disabled={busy}
                   onChange={(o) => {
                     const tv = found.find((f) => f.ip === o.data);
-                    if (tv) update({ ip: tv.ip, driver: tv.kind === "adb" ? "adb" : "sony" });
+                    selectTv(tv?.ip ?? "", tv?.kind === "adb" ? "adb" : "sony");
                   }}
                 />
               </Row>
@@ -431,23 +462,16 @@ function Content() {
               <TextField
                 label={t("tv_ip")}
                 value={s.ip}
-                onChange={(e) => update({ ip: e.target.value.trim(), driver: "sony" })}
+                disabled={busy}
+                onChange={(e) => selectTv(e.target.value.trim(), "sony")}
               />
             </Row>
-            <PanelSectionRow>
-              <div style={{ fontSize: 12, opacity: 0.7 }}>{t(s.driver === "adb" ? "hint_tv_adb" : "hint_tv")}</div>
-            </PanelSectionRow>
-            <Row id="pin-show">
-              <ButtonItem
-                layout="below"
-                disabled={busy || !s.ip}
-                description={t("not_paired")}
-                onClick={() => run(() => pairStart())}
-              >
-                {t(s.driver === "adb" ? "adb_connect" : "pin_show")}
-              </ButtonItem>
-            </Row>
-            {s.driver !== "adb" && (
+            {hasTv && (
+              <PanelSectionRow>
+                <div style={{ fontSize: 12, opacity: 0.7 }}>{t(s.driver === "adb" ? "hint_tv_adb" : "hint_tv")}</div>
+              </PanelSectionRow>
+            )}
+            {hasTv && s.driver !== "adb" && (
               <>
                 <Row id="pin-input">
                   <TextField
@@ -462,6 +486,7 @@ function Content() {
                     disabled={busy || !pin}
                     onClick={() =>
                       run(async () => {
+                        await tvSaved.current;
                         const r = await pairFinish(pin);
                         if (r.ok) setPin("");
                         return r;
@@ -475,28 +500,35 @@ function Content() {
             )}
           </>
         )}
-        {s.paired && s.driver === "adb" && !adbTrainingComplete && (
-          <Row id="train-hdmi">
-            <ButtonItem
-              layout="below"
-              disabled={busy}
-              description={busy ? t("training") : s.adb_trained_ports.length
-                ? `${t("trained_ports")} HDMI ${s.adb_trained_ports.join(", ")}`
-                : t("train_hint")}
-              onClick={() => run(trainHdmi)}
-            >
-              {t("train_hdmi")}
-            </ButtonItem>
-          </Row>
-        )}
         <Row id="hdmi-port">
           <DropdownItem
             label={t("hdmi_port")}
             rgOptions={PORTS}
             selectedOption={s.hdmi_port}
-            onChange={(o) => update({ hdmi_port: o.data as number })}
+            disabled={busy || savingHdmi}
+            onChange={(o) => {
+              setSavingHdmi(true);
+              update({ hdmi_port: o.data as number })
+                .catch((e) => {
+                  setNote(String(e));
+                  return refresh();
+                })
+                .finally(() => setSavingHdmi(false));
+            }}
           />
         </Row>
+        {s.paired && s.driver === "adb" && (
+          <Row id="train-hdmi">
+            <ButtonItem
+              layout="below"
+              disabled={busy || savingHdmi}
+              description={busy ? t("training") : t(hdmiTrained ? "trained_port" : "train_hint", s.hdmi_port)}
+              onClick={() => run(trainHdmi)}
+            >
+              {t("train_hdmi", s.hdmi_port)}
+            </ButtonItem>
+          </Row>
+        )}
       </PanelSection>
 
       {!s.paired && (
