@@ -3,7 +3,7 @@ import threading
 import unittest
 from unittest import mock
 
-from support import main
+from support import SettingsCase, main
 
 BASE = {**main.DEFAULTS, "ip": "192.168.1.95", "auth_cookie": "auth=x", "mac": "aa:bb:cc:dd:ee:ff",
         "hdmi_port": 2, "wake_tv": True}
@@ -247,40 +247,55 @@ class BackKey(unittest.TestCase):
         self.assertEqual(sent, [main.IRCC_BACK])
 
 
-class TvMovedToAnotherAddress(unittest.TestCase):
+class TvMovedToAnotherAddress(SettingsCase):
     """The router gave the TV a new address: it is found again by its MAC address and the setting is updated."""
 
     def setUp(self):
-        main._stop.clear()
+        super().setUp()
+        main._save(BASE)
 
     def run_with(self, tv, found):
-        records, updates = [], []
+        records = []
         with mock.patch.object(main, "_rediscover_ip", return_value=found) as rediscover, \
-                mock.patch.object(main, "_update", lambda change: updates.append(change)), \
                 mock.patch.object(main, "_record", lambda kind, ok, text: records.append((kind, ok, text))):
             result = tv.run()
-        return result, rediscover, records, updates
+        return result, rediscover, records
 
     def test_the_tv_is_followed_to_its_new_address(self):
         tv = FakeTv(initial=0, delay=0.3, lives_at="192.168.1.96")
-        result, rediscover, records, updates = self.run_with(tv, "192.168.1.96")
+        result, rediscover, records = self.run_with(tv, "192.168.1.96")
         self.assertTrue(result["ok"])
         self.assertEqual(rediscover.call_count, 1)
         self.assertGreaterEqual(tv.clock.now, main.HEAL_AFTER)  # not before the TV had a fair chance to answer
-        self.assertEqual(len(updates), 1)  # the new address is saved
+        self.assertEqual(main._load()["ip"], "192.168.1.96")
         self.assertEqual(records[0][:2], ("wake", True))
         self.assertIn("192.168.1.96", records[0][2])
 
     def test_the_search_is_tried_only_once_per_run(self):
         tv = FakeTv(power=itertools.repeat("standby"), lives_at="10.9.9.9")  # a TV that is simply off
-        result, rediscover, records, updates = self.run_with(tv, None)
+        result, rediscover, _ = self.run_with(tv, None)
         self.assertFalse(result["ok"])
         self.assertEqual(rediscover.call_count, 1)
-        self.assertEqual(updates, [])
+        self.assertEqual(main._load()["ip"], BASE["ip"])
+
     def test_a_tv_that_answers_is_never_searched_for(self):
         tv = FakeTv(initial=0, delay=0.3)
-        _, rediscover, _, _ = self.run_with(tv, "192.168.1.96")
+        _, rediscover, _ = self.run_with(tv, "192.168.1.96")
         rediscover.assert_not_called()
+
+    def test_an_old_search_cannot_restore_an_unpaired_tv(self):
+        tv = FakeTv(lives_at="192.168.1.96")
+
+        def unpair_during_search(_):
+            main._update(lambda cur: cur.update(ip="", auth_cookie="", mac=""))
+            return tv.lives_at
+
+        with mock.patch.object(main, "_rediscover_ip", side_effect=unpair_during_search), \
+                mock.patch.object(main, "_record") as record:
+            self.assertIsNone(tv.run())
+        self.assertEqual(main._load()["ip"], "")
+        self.assertEqual(tv.switches, 0)
+        record.assert_not_called()
 
 
 class RediscoverIp(unittest.TestCase):

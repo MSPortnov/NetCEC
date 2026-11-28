@@ -115,6 +115,51 @@ class CancelWake(SettingsCase):
             with self.subTest(departure=departure), mock.patch.object(main, "_suspend_count", return_value=1):
                 asyncio.run(scenario(departure))
 
+    def test_ps_works_after_aborted_steam_sleep_only_once_preparation_has_expired(self):
+        main._save({**main.DEFAULTS, "ip": "192.0.2.4", "auth_cookie": "auth=test"})
+        plugin = main.Plugin()
+        plugin._ps_last_action = float("-inf")
+
+        async def scenario():
+            with mock.patch.object(main, "_tv_suspend", return_value=None), \
+                    mock.patch.object(main, "_t_current_port", return_value=0), \
+                    mock.patch.object(main, "_tv_fast", return_value=None) as wake:
+                await plugin.on_suspend()
+                old = plugin._wake_cancelled
+                await plugin._on_ps_press()
+                wake.assert_not_called()
+
+                plugin._sleep_ts -= 11
+                plugin._logind_sleeping = True
+                await plugin._on_ps_press()
+                wake.assert_not_called()
+
+                plugin._logind_sleeping = False
+                await plugin._on_ps_press()
+                wake.assert_called_once()
+                self.assertTrue(old.is_set())
+                self.assertFalse(wake.call_args.args[1].is_set())
+
+        asyncio.run(scenario())
+
+    def test_a_logind_sleep_end_reenables_ps_even_if_the_kernel_count_did_not_change(self):
+        plugin = main.Plugin()
+        plugin._last_suspends = 2
+
+        async def scenario():
+            with mock.patch.object(main, "_suspend_count", return_value=2), \
+                    mock.patch.object(main, "_tv_suspend", return_value=None), \
+                    mock.patch.object(main, "_resume_all", new_callable=mock.AsyncMock) as resume:
+                await plugin._on_logind("sleep", True)
+                old = plugin._wake_cancelled
+                await plugin._on_logind("sleep", False)
+                await asyncio.gather(*plugin._bg)
+                self.assertTrue(old.is_set())
+                self.assertFalse(plugin._wake_cancelled.is_set())
+                resume.assert_not_awaited()
+
+        asyncio.run(scenario())
+
 
 class SleepDetector(SettingsCase):
     def test_suspend_counter_detects_a_short_sleep_without_waiting_for_clock_threshold(self):

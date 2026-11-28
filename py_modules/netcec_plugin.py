@@ -45,6 +45,7 @@ class Plugin:
         self._bg = set()
         self._wake_cancelled = threading.Event()
         self._shutting_down = False
+        self._logind_sleeping = False
 
     def _spawn(self, coro):
         t = asyncio.get_event_loop().create_task(coro)
@@ -174,8 +175,12 @@ class Plugin:
             if not duplicate:
                 self._runtime._last_resume = now
         if duplicate:
+            if source == "logind" and self._wake_cancelled.is_set():
+                self._sleep_fut, self._sleep_ts = None, 0.0
+                self._wake_cancelled = threading.Event()
             self._runtime._log(f"resume ({source}) skipped: duplicate")
             return {**self._runtime._ok(self._runtime._t("dup")), "skipped": True}
+        self._logind_sleeping = False
         self._sleep_fut, self._sleep_ts = None, 0.0  # a new sleep after this resume must not be skipped
         self._wake_cancelled.set()
         self._wake_cancelled = threading.Event()
@@ -220,6 +225,8 @@ class Plugin:
 
     async def _on_logind(self, kind: str, going_down: bool, typ=None):
         self._runtime._log(f"logind: {kind} {'start' if going_down else 'end'}" + (f" (type={typ})" if typ else ""))
+        if kind == "sleep":
+            self._logind_sleeping = going_down
         if going_down:
             try:
                 if kind == "sleep":
@@ -460,9 +467,14 @@ class Plugin:
 
     async def _on_ps_press(self):
         """Return to the configured HDMI input after PS, but only while the TV is on another input."""
-        cancelled = self._wake_cancelled
-        if cancelled.is_set():
+        if self._shutting_down or self._logind_sleeping:
             return
+        if self._wake_cancelled.is_set():
+            if self._sleep_recent():
+                return
+            # Steam can announce sleep and then abort before logind sees it. Old workers remain cancelled.
+            self._wake_cancelled = threading.Event()
+        cancelled = self._wake_cancelled
         now = time.monotonic()
         if now - self._ps_last_action < 3.0:
             return

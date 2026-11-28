@@ -158,6 +158,20 @@ class FakeAdbd:
             conn.close()
 
 
+class HandshakeCleanup(unittest.TestCase):
+    def test_a_failed_handshake_closes_the_socket(self):
+        for stage in ("_send", "_recv"):
+            with self.subTest(stage=stage):
+                sock = mock.Mock()
+                conn = adb.Connection("192.0.2.4", {})
+                with mock.patch.object(adb.socket, "create_connection", return_value=sock), \
+                        mock.patch.object(conn, stage, side_effect=adb.AdbError("handshake failed")):
+                    with self.assertRaisesRegex(adb.AdbError, "handshake failed"):
+                        conn.connect()
+                self.assertFalse(conn.alive)
+                sock.close.assert_called_once_with()
+
+
 class Connection(unittest.TestCase):
     def setUp(self):
         self.tv = FakeAdbd(outputs={"echo hi": "hi\n", "big": "x" * 1000 + "\u00e4\u00f6\n"})
@@ -196,12 +210,14 @@ class Connection(unittest.TestCase):
     def test_long_output_arrives_in_pieces_and_is_decoded(self):
         self.tv.known.append((key()["n"], key()["e"]))
         c = self.connection().connect()
+        self.addCleanup(c.close)
         out = c.shell("big")
         self.assertEqual(out, "x" * 1000 + "\u00e4\u00f6\n")
 
     def test_several_commands_on_one_connection(self):
         self.tv.known.append((key()["n"], key()["e"]))
         c = self.connection().connect()
+        self.addCleanup(c.close)
         c.shell("echo hi")
         c.shell("echo hi")
         self.assertEqual(self.tv.commands, ["echo hi", "echo hi"])

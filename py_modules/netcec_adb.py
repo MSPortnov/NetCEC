@@ -182,9 +182,9 @@ class Connection:
         except OSError as e:
             raise AdbError(f"no connection: {e}")
         deadline = time.monotonic() + self.timeout
-        self._send(A_CNXN, A_VERSION, MAX_DATA, b"host::\0", deadline)
         signed = offered = False
         try:
+            self._send(A_CNXN, A_VERSION, MAX_DATA, b"host::\0", deadline)
             while True:
                 command, arg0, _arg1, data = self._recv(deadline)
                 if command == A_CNXN:
@@ -208,7 +208,7 @@ class Connection:
             if offered:
                 raise NeedsApproval("the TV asks to allow debugging")
             raise AdbError("timed out while logging in")
-        except NeedsApproval:
+        except Exception:
             self.close()
             raise
 

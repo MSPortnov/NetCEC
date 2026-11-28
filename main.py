@@ -1271,8 +1271,10 @@ def _tv_fast(s, cancelled=None):
             if stopped():
                 return None
             if new_ip:
+                if not _update_for_tv(s, lambda cur: cur.update(ip=new_ip), "mac", "auth_cookie", "adb_ok"):
+                    _log("TV: ignored rediscovery because the pairing changed")
+                    return None
                 s["ip"] = new_ip
-                _update(lambda cur: cur.update(ip=new_ip))
                 _record("wake", True, _t("ip_changed", ip=new_ip))
                 _log(f"TV: found at the new address {new_ip}")
                 first = True  # try the switch at once
