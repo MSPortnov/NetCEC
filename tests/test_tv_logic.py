@@ -1,4 +1,5 @@
 import itertools
+import threading
 import unittest
 from unittest import mock
 
@@ -34,24 +35,32 @@ class FakeTv:
     - `first_looks`: scripted answers for the first looks (None = no answer at all), e.g. a sleeping TV."""
 
     def __init__(self, power=(), initial=0, delay=1.0, ignore_commands=0, first_looks=(), home_fails=False,
-                 lives_at=None):
+                 lives_at=None, fail_first_switches=0):
         self.power = iter(power)
         self.initial, self.delay, self.ignore = initial, delay, ignore_commands
         self.first_looks = list(first_looks)
         self.home_fails = home_fails
         self.lives_at = lives_at  # the address the TV answers on (None: any)
+        self.fail_switches = fail_first_switches  # a TV in standby refuses the first commands
         self.sent, self.commands, self.effective_at = [], 0, None
         self.clock = FakeClock()
 
     def rest(self, s, service, method, params=None, timeout=4):
+        if self.lives_at and s["ip"] != self.lives_at:
+            raise OSError("unreachable")
         self.sent.append(method)
         if method == "setPlayContent":
+            if self.fail_switches > 0:
+                self.fail_switches -= 1
+                raise RuntimeError([40005, "Display Is Turned off"])
             self.commands += 1
             if self.commands > self.ignore:
                 self.effective_at = self.clock.now + self.delay
         return {}
 
     def ircc(self, s, code, timeout=3):
+        if self.lives_at and s["ip"] != self.lives_at:
+            raise OSError("unreachable")
         self.sent.append("KEY")
         if self.home_fails:
             raise RuntimeError("ircc failed")
@@ -126,27 +135,47 @@ class TvFast(unittest.TestCase):
     def setUp(self):
         main._stop.clear()  # another test may have set the unload flag
 
-    def test_already_on_the_right_input_sends_nothing(self):
+    def test_a_tv_that_is_already_on_the_port_gets_the_command_too_and_confirms_at_once(self):
+        # nothing is asked first: asking costs time on every wake-up, and the command is harmless there
         tv = FakeTv(initial=2)
-        self.assertTrue(tv.run()["ok"])
-        self.assertEqual(tv.sent, [])
-
+        r = tv.run()
+        self.assertTrue(r["ok"])
+        self.assertEqual(sorted(tv.sent), ["KEY", "setPlayContent"])
+        self.assertEqual(tv.clock.sleeps, [main.CONFIRM_STEP])
     def test_a_tv_that_is_on_is_never_sent_wake_commands(self):
         tv = FakeTv(initial=0, delay=0.3)  # home screen / screensaver: "something else", not "no answer"
         tv.run()
         self.assertNotIn("setPowerStatus", tv.sent)
         self.assertNotIn("wol", tv.sent)
 
-    def test_screensaver_or_home_screen_gets_a_key_then_one_switch(self):
+    def test_screensaver_or_home_screen_gets_the_key_and_one_switch(self):
         tv = FakeTv(initial=0, delay=0.3)
         self.assertTrue(tv.run()["ok"])
-        self.assertEqual(tv.sent, ["KEY", "setPlayContent"])
+        self.assertEqual(sorted(tv.sent), ["KEY", "setPlayContent"])
 
+    def test_the_key_and_the_switch_go_out_at_the_same_moment(self):
+        barrier = threading.Barrier(2, timeout=2)  # both calls must be in flight together, or this test fails
+
+        class Together(FakeTv):
+            def rest(self, s, service, method, params=None, timeout=4):
+                if method == "setPlayContent":
+                    barrier.wait()
+                return super().rest(s, service, method, params, timeout)
+
+        tv = Together(initial=0, delay=0.3)
+        tv.ircc = lambda s, code, timeout=3: (barrier.wait(), tv.sent.append("KEY"))
+        self.assertTrue(tv.run()["ok"])
+        self.assertEqual(sorted(tv.sent), ["KEY", "setPlayContent"])
+
+    def test_nothing_waits_before_the_command(self):
+        tv = FakeTv(initial=0, delay=0.3)
+        tv.run()
+        self.assertEqual(tv.clock.sleeps[0], main.CONFIRM_STEP)  # the first thing the code waits for is the TV's answer
+        self.assertFalse(hasattr(main, "KEY_PAUSE"))
     def test_waiting_is_short_when_the_tv_switches_at_once(self):
         tv = FakeTv(initial=0, delay=0.3)
         tv.run()
-        self.assertEqual(tv.clock.sleeps, [main.KEY_PAUSE, main.CONFIRM_STEP])
-
+        self.assertEqual(tv.clock.sleeps, [main.CONFIRM_STEP])
     def test_a_slow_tv_is_waited_for_without_sending_the_command_again(self):
         # seen on the real TV: it reports the new input only after 3 to 9 seconds
         for delay in (3.2, 6.0, 7.5):
@@ -180,20 +209,23 @@ class TvFast(unittest.TestCase):
     def test_failed_key_press_does_not_block_the_switch(self):
         tv = FakeTv(initial=0, delay=0.3, home_fails=True)
         self.assertTrue(tv.run()["ok"])
-        self.assertEqual(tv.sent, ["KEY", "setPlayContent"])
-
-    def test_sleeping_tv_is_woken_without_pressing_a_key_first(self):
-        tv = FakeTv(power=["standby", "active"], first_looks=[None, 0], delay=0.3)
+        self.assertEqual(sorted(tv.sent), ["KEY", "setPlayContent"])
+    def test_a_sleeping_tv_refuses_the_command_is_woken_and_then_switched(self):
+        tv = FakeTv(power=["standby", "active"], fail_first_switches=1, delay=0.3)
         r = tv.run()
         self.assertTrue(r["ok"])
-        self.assertEqual(tv.sent, ["setPowerStatus", "wol", "KEY", "setPlayContent"])
-
+        first_try = tv.sent.index("setPlayContent")
+        wake = tv.sent.index("setPowerStatus")
+        last_try = len(tv.sent) - 1 - tv.sent[::-1].index("setPlayContent")
+        self.assertLess(first_try, wake)  # the command went first ...
+        self.assertLess(wake, last_try)   # ... the TV was woken, and the command went again
+        self.assertIn("wol", tv.sent)
+        self.assertEqual(tv.sent.count("KEY"), 2)  # the key goes with every try until a command took
     def test_a_tv_that_never_answers_gives_up_after_the_wake_window(self):
-        tv = FakeTv(power=itertools.repeat("standby"), first_looks=[None] * 500)
+        tv = FakeTv(power=itertools.repeat("standby"), lives_at="10.9.9.9")  # nothing answers at the address
         r = tv.run()
         self.assertFalse(r["ok"])
         self.assertGreaterEqual(tv.clock.now, main.WAKE_WINDOW)
-
     def test_not_configured(self):
         self.assertFalse(FakeTv().run({"auth_cookie": ""})["ok"])
         self.assertFalse(FakeTv().run({"ip": ""})["ok"])
@@ -240,12 +272,11 @@ class TvMovedToAnotherAddress(unittest.TestCase):
         self.assertIn("192.168.1.96", records[0][2])
 
     def test_the_search_is_tried_only_once_per_run(self):
-        tv = FakeTv(power=itertools.repeat("standby"), first_looks=[None] * 500)
-        result, rediscover, records, updates = self.run_with(tv, None)  # a TV that is simply off
+        tv = FakeTv(power=itertools.repeat("standby"), lives_at="10.9.9.9")  # a TV that is simply off
+        result, rediscover, records, updates = self.run_with(tv, None)
         self.assertFalse(result["ok"])
         self.assertEqual(rediscover.call_count, 1)
         self.assertEqual(updates, [])
-
     def test_a_tv_that_answers_is_never_searched_for(self):
         tv = FakeTv(initial=0, delay=0.3)
         _, rediscover, _, _ = self.run_with(tv, "192.168.1.96")

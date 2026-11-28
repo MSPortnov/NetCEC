@@ -135,10 +135,11 @@ No Sony Bravia at hand? You can still check that the plugin loads and works:
 - TV discovery: SSDP (UPnP) multicast search; a device is listed only if its description shows a Sony
   manufacturer and the Scalar Web API, and the description is fetched only from the device that answered.
 - TV control: Sony Bravia IP Control (REST + IRCC), PIN pairing, Wake-on-LAN as a backup wake-up.
-- On start and on resume the plugin asks the TV which input it shows and sends nothing if it is already on
-  the right port. Otherwise it presses the remote's Back key (it ends a running screensaver), then sends the input
-  switch once (0.1 s apart), and asks the TV every 0.4 s until it reports the port: after a resume the TV
-  needs a few seconds for that, and a repeated command only restarts its switching. The command is sent
+- On start and on resume nothing is asked first and nothing is waited for: the remote's Back key (it ends a
+  running screensaver) and the input switch go out at the same moment (two requests at once for Sony; one shell
+  line with Back in the background for an Android TV, whose power state is asked first because a sleeping one
+  would swallow the command). Then the plugin asks the TV every 0.4 s until it reports the port: after a
+  resume the TV needs a few seconds for that, and a repeated command only restarts its switching. The command is sent
   once more only if the TV has not confirmed after 8 s; after that the result is "sent, not confirmed".
   A TV that does not answer is woken (power on + Wake-on-LAN) every ~3 s for up to 45 s. Every switch writes
   one log line with the time of each step and what the TV said.

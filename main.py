@@ -840,18 +840,30 @@ def _adb_power_state(s):
     return "standby" if m.group(1) in ("Asleep", "Dozing") else "active"
 
 
-def _adb_switch(s, port):
+def _adb_switch_command(s, port):
     profile = ANDROID_TV_INPUTS.get(_adb_brand(s))
     if profile and port in profile["hw"]:
         uri = profile["uri"].format(hw=profile["hw"][port])
-        out = _adb_shell(s, f'am start -a android.intent.action.VIEW -d "{uri}"', 4.0)
-        if "Error" in out or "Exception" in out:
-            raise RuntimeError(" ".join(out.split())[:120])
-        return
+        return f'am start -a android.intent.action.VIEW -d "{uri}"'
     code = GENERIC_HDMI_KEYCODES.get(port)
     if code is None:
         raise RuntimeError(f"HDMI {port} is not supported on this TV")
-    _adb_shell(s, f"input keyevent {code}", SEND_TIMEOUT + 1)
+    return f"input keyevent {code}"
+
+
+def _adb_go(s, port, press_back):
+    """Switch to an HDMI port; with press_back the Back key (it ends a screensaver) goes at the same moment: both
+    run on the TV at once instead of one after the other."""
+    command = _adb_switch_command(s, port)
+    if press_back:
+        command = f"input keyevent 4 & {command}; wait"
+    out = _adb_shell(s, command, 5.0)
+    if "Error" in out or "Exception" in out:
+        raise RuntimeError(" ".join(out.split())[:120])
+
+
+def _adb_switch(s, port):
+    _adb_go(s, port, False)
 
 
 def _port_open(ip, port, timeout=0.8):
@@ -914,6 +926,28 @@ def _t_switch(s, port):
         _rest(s, "avContent", "setPlayContent", [{"uri": f"extInput:hdmi?port={port}"}], timeout=SEND_TIMEOUT)
 
 
+def _t_go(s, port, press_back):
+    """The key that ends a screensaver and the input switch, sent at the same moment: the TV starts leaving the
+    screensaver and switching together instead of one after the other."""
+    if _is_adb(s):
+        _adb_go(s, port, press_back)
+        return
+    key = None
+    if press_back:
+        def back():
+            try:
+                _t_back(s)
+            except Exception:  # a key that did not go through is not worth failing the switch
+                pass
+        key = threading.Thread(target=back, daemon=True)
+        key.start()
+    try:
+        _t_switch(s, port)
+    finally:
+        if key:
+            key.join(SEND_TIMEOUT + 1)
+
+
 def _t_wake(s):
     """Power on (and Wake-on-LAN): neither may fail the caller."""
     try:
@@ -950,7 +984,6 @@ def _t_verifies(s):
 
 
 SEND_TIMEOUT = 2      # seconds for every request to the TV while waking / switching
-KEY_PAUSE = 0.1       # pause between the key press (ends a screensaver) and the input switch (s)
 CONFIRM_STEP = 0.4    # after the switch the TV is asked this often which input it shows (s) ...
 CONFIRM_WINDOW = 8.0  # ... for this long: after a resume a TV reports the input only after 5-9 s (until then: "Illegal State")
 SWITCH_SENDS = 2      # the switch command is sent at most this many times (never more while the TV is busy)
@@ -960,9 +993,8 @@ WAKE_WINDOW = 45      # how long a sleeping TV may take to wake up (s)
 
 def _tv_fast(s):
     """Wake the TV and switch it to our HDMI port as early as possible.
-    The TV is asked at once which input it shows (it is usually already on): if that is the right
-    HDMI port nothing is sent. Otherwise the remote's Back key is pressed first (it ends a running
-    screensaver, which a plain input switch does not), then the input switch is sent once. Then the TV is
+    Nothing is asked first and nothing is waited for: the remote's Back key (it ends a running screensaver,
+    which a plain input switch does not) and the input switch go out at the same moment. Then the TV is
     asked every CONFIRM_STEP until it reports the port: it needs seconds for that, and sending the command again
     while it is still busy only restarts its switching. Only if it has not confirmed after
     CONFIRM_WINDOW the command is sent one more time; after that the result is "sent, not confirmed".
@@ -1000,24 +1032,14 @@ def _tv_fast(s):
     while time.monotonic() < deadline and not _stop.is_set():
         st = None
         try:
-            if not first:  # first try: no state check, just look at the input and switch
+            # First try: no state check, the command goes at once (a Sony TV in standby refuses it and the wake path
+            # starts). An Android TV in standby would swallow it silently, so its power state is asked first.
+            if not first or _is_adb(s):
                 st = _t_power_state(s)
-            if first or st == "active":
-                cur = look()
-                if cur == port:  # already on the right input: nothing to send
-                    _log(f"TV: already on HDMI {port} ({summary()})")
-                    return _ok(_t("switched", port=port))
-                if cur is None and first:  # no answer and the state is unknown: TV off, go and wake it
-                    raise RuntimeError("TV not reachable")
-                if sends == 0:  # any key ends a running screensaver; not critical if it fails
-                    try:
-                        timed("key", _t_back, s)
-                        time.sleep(KEY_PAUSE)
-                    except AuthError:
-                        raise
-                    except Exception:
-                        pass
-                timed("switch", _t_switch, s, port)
+            if (first and not _is_adb(s)) or st == "active":
+                timed("go", _t_go, s, port, sends == 0)  # Back (only the first time) and the switch together
+                if not answered:
+                    answered.append(time.monotonic() - t0)  # the TV took the command: it is up
                 sends += 1
                 _learn_mac(s)
                 if not _t_verifies(s):  # the command went through and that is all this kind of TV can tell

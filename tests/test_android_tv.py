@@ -133,6 +133,25 @@ class Commands(unittest.TestCase):
         with mock.patch.object(main, "_adb_shell", sh), self.assertRaises(RuntimeError):
             main._adb_switch(ADB, 1)
 
+    def test_back_can_go_with_the_switch_in_one_line(self):
+        _, sh = self.run_with(main._adb_go, ADB, 2, True)
+        self.assertTrue(sh.commands[-1].startswith("input keyevent 4 & am start -a android.intent.action.VIEW -d "))
+        self.assertTrue(sh.commands[-1].endswith("; wait"))
+        self.assertIn(TCL_USER_IDS[2], sh.commands[-1])
+        _, sh = self.run_with(main._adb_go, ADB, 2, False)
+        self.assertTrue(sh.commands[-1].startswith("am start"))  # without Back: the switch alone
+
+    def test_back_goes_with_other_brands_keys_too(self):
+        _, sh = self.run_with(main._adb_go, ADB, 3, True, brand="Xiaomi")
+        self.assertEqual(sh.commands[-1], "input keyevent 4 & input keyevent 245; wait")
+
+    def test_an_error_in_the_combined_line_is_still_an_error(self):
+        sh = Shell()
+        sh.__class__ = type("Bad", (Shell,), {"__call__": lambda self, s, c, t=4.0: (
+            "Error: Activity not started\n" if "am start" in c else Shell.__call__(self, s, c, t))})
+        with mock.patch.object(main, "_adb_shell", sh), self.assertRaises(RuntimeError):
+            main._adb_go(ADB, 1, True)
+
     def test_the_brand_is_asked_once_per_tv(self):
         _, sh = self.run_with(lambda: [main._adb_switch(ADB, 1), main._adb_switch(ADB, 2)])
         self.assertEqual(sum(c.startswith("getprop") for c in sh.commands), 1)
@@ -218,7 +237,7 @@ class FakeAdbTv:
         if "keyevent 223" in command:
             self.asleep = True
             return ""
-        if command.startswith("am start"):
+        if "am start" in command:  # also inside "input keyevent 4 & am start ...; wait"
             for port, hw in TCL_USER_IDS.items():
                 if hw in command:
                     self.port = port
@@ -247,38 +266,40 @@ class AndroidTvWakesUp(unittest.TestCase):
         main._stop.clear()
         main._adb_state["brand"].clear()
 
-    def test_a_tv_on_its_home_screen_gets_back_and_the_input(self):
+    def test_a_tv_on_its_home_screen_gets_back_and_the_input_in_one_command(self):
         tv = FakeAdbTv(port=0)
         r = tv.run(main._tv_fast, dict(ADB))
         self.assertTrue(r["ok"])
         self.assertIn("HDMI 4", r["message"])
         self.assertEqual(tv.port, 4)
-        sent = [c for c in tv.commands if c.startswith(("input", "am start"))]
-        self.assertEqual(sent[0], "input keyevent 4")  # Back first (it ends a screensaver) ...
-        self.assertTrue(sent[1].startswith("am start") and TCL_USER_IDS[4] in sent[1])  # ... then the input
+        goes = [c for c in tv.commands if "am start" in c]
+        self.assertEqual(len(goes), 1)
+        # Back runs in the background of the same shell line, at the same moment as the input is opened
+        self.assertTrue(goes[0].startswith("input keyevent 4 & am start"), goes[0])
+        self.assertIn(TCL_USER_IDS[4], goes[0])
+        self.assertTrue(goes[0].endswith("; wait"))
         self.assertNotIn("wol", tv.commands)  # an awake TV is never sent wake commands
-
     def test_the_switch_is_not_waited_for(self):
         tv = FakeAdbTv(port=0)
         tv.run(main._tv_fast, dict(ADB))
         self.assertLess(tv.clock.now, 1)  # one short pause, no 8 s confirmation window
 
-    def test_a_tv_that_is_already_on_the_port_is_left_alone(self):
+    def test_an_awake_tv_gets_the_command_whatever_it_shows(self):
+        # an Android TV cannot tell its input precisely, so nothing is asked: the command goes (harmless on the port)
         tv = FakeAdbTv(port=4)
         r = tv.run(main._tv_fast, dict(ADB))
         self.assertTrue(r["ok"])
-        self.assertEqual([c for c in tv.commands if c.startswith(("input", "am start"))], [])
-
+        self.assertEqual(len([c for c in tv.commands if "am start" in c]), 1)
     def test_a_sleeping_tv_is_woken_and_then_switched(self):
         tv = FakeAdbTv(asleep=True, wake_delay=3.0)
         r = tv.run(main._tv_fast, dict(ADB))
         self.assertTrue(r["ok"])
         self.assertEqual(tv.port, 4)
-        sent = [c for c in tv.commands if c.startswith(("input", "am start", "wol"))]
-        self.assertEqual(sent[:2], ["input keyevent 224", "wol"])
-        self.assertLess(sent.index("input keyevent 224"), [i for i, c in enumerate(sent) if c.startswith("am start")][0])
-        self.assertEqual(sent.count("input keyevent 4"), 1)
-
+        sent = [c for c in tv.commands if c.startswith("input keyevent 224") or c == "wol" or "am start" in c]
+        self.assertEqual(sent[:2], ["input keyevent 224", "wol"])  # woken first: a sleeping TV would swallow the command
+        self.assertEqual(len(sent), 3)
+        self.assertIn("am start", sent[2])
+        self.assertTrue(sent[2].startswith("input keyevent 4 & "))  # Back goes with the command, once
     def test_another_port_is_switched_to_the_users_port(self):
         for want in (1, 2, 3):
             tv = FakeAdbTv(port=4)
@@ -515,7 +536,7 @@ class EndToEnd(SettingsCase):
             "getprop ro.product.manufacturer; getprop ro.product.brand": "TCL\nTCL\n",
             main._ADB_LOOK_CMD: look,
             "dumpsys power | grep -m1 mWakefulness=": "mWakefulness=Awake\n",
-            f'am start -a android.intent.action.VIEW -d "{uri}"': "Starting: Intent { act=android.intent.action.VIEW }\n",
+            f'input keyevent 4 & am start -a android.intent.action.VIEW -d "{uri}"; wait': "Starting: Intent { act=android.intent.action.VIEW }\n",
         })
         self.addCleanup(self.tv.close)
         main._adb_state.update(conn=None, ip=None, used=0.0, brand={})
@@ -536,10 +557,11 @@ class EndToEnd(SettingsCase):
         result = main._tv_fast({**self.settings, "adb_ok": True})
         self.assertTrue(result["ok"], result)
         self.assertIn("HDMI 4", result["message"])
-        self.assertEqual(self.tv.commands[0].split(";")[0], "getprop ro.product.manufacturer")
-        sent = [c for c in self.tv.commands if c.startswith(("input", "am start"))]
-        self.assertEqual(sent[0], "input keyevent 4")  # Back ends a screensaver ...
-        self.assertTrue(sent[1].startswith("am start") and TCL_USER_IDS[4] in sent[1])  # ... then the input of port 4
+        # an Android TV is asked whether it is awake first (a sleeping one would swallow the command) ...
+        self.assertEqual(self.tv.commands[0], "dumpsys power | grep -m1 mWakefulness=")
+        goes = [c for c in self.tv.commands if "am start" in c]
+        self.assertEqual(len(goes), 1)  # Back and the input of port 4 in one line, at the same moment
+        self.assertTrue(goes[0].startswith("input keyevent 4 & am start") and TCL_USER_IDS[4] in goes[0])
 
     def test_going_to_sleep_with_the_tv_on_another_input_leaves_it_alone(self):
         self.tv.known.append((__import__("test_adb_client").key()["n"], 65537))
