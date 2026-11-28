@@ -90,6 +90,15 @@ class Discover(unittest.TestCase):
         for path in ("/router.xml", "/ps.xml", "/handycam.xml", "/missing.xml"):
             self.assertEqual(self.found([path]), [], path)
 
+    def test_every_ssdp_responder_is_checked_beyond_the_old_limit(self):
+        locations = {f"192.168.1.{i}": ["description"] for i in range(1, 25)}
+        with mock.patch.object(main, "_ssdp_search", return_value=locations), \
+                mock.patch.object(main, "_fetch_description", return_value=BRAVIA_DMR), \
+                mock.patch.object(main, "_log", lambda _message: None):
+            found = main._discover()
+        self.assertEqual(len(found), 24)
+        self.assertEqual({tv["ip"] for tv in found}, set(locations))
+
     def test_a_description_on_a_foreign_address_is_never_fetched(self):
         self.assertIsNone(main._fetch_description("10.0.0.5", self.srv.url("/dmr.xml")))
 

@@ -222,6 +222,17 @@ class Connection(unittest.TestCase):
             adb.Connection("127.0.0.1", key(), port=silent.port, timeout=0.5).connect()
         self.assertLess(time.monotonic() - t0, 3)
 
+    def test_oversized_packet_is_rejected_before_its_payload_is_read(self):
+        c = self.connection()
+        c.sock = mock.Mock()
+        c.max_data = 32
+        header = struct.pack("<6I", adb.A_WRTE, 1, 1, 33, 0, adb.A_WRTE ^ 0xFFFFFFFF)
+        with mock.patch.object(c, "_read", return_value=header) as read:
+            with self.assertRaises(adb.AdbError):
+                c._recv(time.monotonic() + 1)
+        self.assertEqual(read.call_count, 1)
+        self.assertFalse(c.alive)
+
     def test_a_command_that_hangs_is_cut_off(self):
         class Hang(FakeAdbd):
             def _send(self, conn, cmd, a0, a1, data=b""):

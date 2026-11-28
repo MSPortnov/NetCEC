@@ -13,7 +13,7 @@ ALLOWED = {
     "asyncio", "base64", "ctypes", "decky", "functools", "json", "os", "re", "shutil", "socket",
     "subprocess", "threading", "time", "urllib.error", "urllib.parse", "urllib.request",
     "sys", "struct",  # struct: Decky itself (aiohttp) needs it
-    "netcec_adb",     # our own ADB client in py_modules
+    "main", "netcec_adb", "netcec_discovery", "netcec_usb", "netcec_plugin",  # our modules in py_modules
 }
 
 paths = sys.argv[1:] or ["main.py"] + sorted(glob.glob("py_modules/*.py"))

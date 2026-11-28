@@ -20,6 +20,7 @@ type Settings = {
   hdmi_port: number;
   wake_tv: boolean;
   driver: string;
+  adb_trained_ports: number[];
   journal: boolean;
   suspend_action: string;
   shutdown_action: string;
@@ -39,6 +40,7 @@ const getInfo = callable<[], Info>("get_info");
 const findTvs = callable<[], TvFound[]>("find_tvs");
 const getEvents = callable<[], EventItem[]>("get_events");
 const pairStart = callable<[], Result>("pair_start");
+const trainHdmi = callable<[], Result>("train_hdmi");
 const pairFinish = callable<[string], Result>("pair_finish");
 const tvStatus = callable<[], Result>("tv_status");
 const tvUnpair = callable<[], Result>("tv_unpair");
@@ -66,6 +68,10 @@ const STR: Record<Lang, Record<string, string>> = {
     hint_tv: "Turn the TV on and press «Find TV» (or enter its IP address). On the TV: IP control > Authentication = Normal, enable Remote start. Then show the PIN and enter it below.",
     hint_tv_adb: "On the TV: Developer options > turn on Network debugging (USB debugging). Then press Connect: the TV asks to allow debugging, choose \u201cAlways allow\u201d.",
     adb_connect: "Connect",
+    train_hdmi: "Teach the plugin to detect HDMI ports",
+    train_hint: "The TV will visit HDMI 1–4, then return to the selected port.",
+    trained_ports: "HDMI input detection has been learned.",
+    training: "Teaching input detection…",
     kind_adb: "Android TV",
     pin_show: "Show PIN on TV",
     not_paired: "Not paired",
@@ -118,6 +124,10 @@ const STR: Record<Lang, Record<string, string>> = {
     hint_tv: "Включите ТВ и нажмите «Найти ТВ» (или введите IP-адрес). На ТВ: IP-управление → Аутентификация = Normal, включите «Remote start». Затем покажите PIN и введите его ниже.",
     hint_tv_adb: "На ТВ: «Для разработчиков» → включите «Отладка по сети» (отладка по USB). Затем нажмите «Подключить»: ТВ спросит разрешение на отладку, выберите «Всегда разрешать».",
     adb_connect: "Подключить",
+    train_hdmi: "Обучить плагин определять HDMI-порт?",
+    train_hint: "ТВ по очереди переключится на HDMI 1–4, затем вернётся на выбранный порт.",
+    trained_ports: "Определение HDMI-входов обучено.",
+    training: "Обучаю определять входы…",
     kind_adb: "Android TV",
     pin_show: "Показать PIN на ТВ",
     not_paired: "Не сопряжено",
@@ -273,15 +283,16 @@ function Content() {
       .catch(() => {});
   const refreshInfo = () => getInfo().then(setInfo);
 
-  // Looks for Sony TVs on the network; a single TV is filled in automatically if no IP is set yet
+  // Looks for supported TVs on the network; a single result is selected automatically.
   const discover = async (currentIp: string) => {
     setSearching(true);
     try {
       const list = await findTvs();
       setFound(list);
       if (list.length === 1 && !currentIp) {
-        await setSettings({ ip: list[0].ip });
-        setS((cur) => (cur ? { ...cur, ip: list[0].ip } : cur));
+        const selection = { ip: list[0].ip, driver: list[0].kind === "adb" ? "adb" : "sony" };
+        await setSettings(selection);
+        setS((cur) => (cur ? { ...cur, ...selection } : cur));
       }
     } catch (e) {
       setFound([]);
@@ -352,6 +363,7 @@ function Content() {
   };
 
   const paired = s.paired;
+  const adbTrainingComplete = [1, 2, 3, 4].every((port) => s.adb_trained_ports.includes(port));
 
   return (
     <>
@@ -462,6 +474,20 @@ function Content() {
               </>
             )}
           </>
+        )}
+        {s.paired && s.driver === "adb" && !adbTrainingComplete && (
+          <Row id="train-hdmi">
+            <ButtonItem
+              layout="below"
+              disabled={busy}
+              description={busy ? t("training") : s.adb_trained_ports.length
+                ? `${t("trained_ports")} HDMI ${s.adb_trained_ports.join(", ")}`
+                : t("train_hint")}
+              onClick={() => run(trainHdmi)}
+            >
+              {t("train_hdmi")}
+            </ButtonItem>
+          </Row>
         )}
         <Row id="hdmi-port">
           <DropdownItem

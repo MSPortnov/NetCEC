@@ -15,7 +15,7 @@ TCL_USER_IDS = {1: "HW1413744128", 2: "HW1413744384", 3: "HW1413744640", 4: "HW1
 
 
 def look_output(power="Awake", starter=(), resumed="com.google.android.tvlauncher/.MainActivity"):
-    return (f"mWakefulness={power}\n##starter\n" + "\n".join(starter) + "\n##resumed\n"
+    return (f"mWakefulness={power}\n##starter\n" + "\n".join(starter) + "\n##tvinput\n##resumed\n"
             + (f"  topResumedActivity=ActivityRecord{{1 u0 {resumed} t12}}\n" if resumed else ""))
 
 
@@ -47,6 +47,21 @@ class Parse(unittest.TestCase):
 
     def test_an_input_without_any_trace_of_which_one_is_unknown(self):
         self.assertEqual(self.parse(look_output(starter=[], resumed="com.tcl.tvinput/.X"))[0], -1)
+
+    def test_sony_hw5_maps_to_hdmi4_even_when_all_profiles_are_dumped(self):
+        text = look_output(starter=["HW5", "HW5"], resumed="com.sony.dtv.tvx/.MainActivity").replace(
+            "##tvinput\n", "##tvinput\nResourceClientProfile { hdmi_port=1 }\n"
+            "ResourceClientProfile { hdmi_port=2 }\nResourceClientProfile { hdmi_port=3 }\n"
+            "ResourceClientProfile { hdmi_port=4 }\n")
+        self.assertEqual(self.parse(text)[0], 4)
+
+    def test_sony_hw2_maps_to_hdmi1(self):
+        self.assertEqual(self.parse(look_output(starter=["HW2"], resumed="com.sony.dtv.tvx/.MainActivity"))[0], 1)
+
+    def test_sony_activity_has_no_adb_specific_input_mapping(self):
+        port, explanation = self.parse(look_output(resumed="com.sony.dtv.tvx/.MainActivity"))
+        self.assertEqual(port, -1)
+        self.assertIn("which one is unknown", explanation)
 
     def test_an_answer_without_power_state_is_unknown_not_off(self):
         self.assertEqual(self.parse("garbage")[0], -1)

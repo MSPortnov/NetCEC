@@ -135,15 +135,23 @@ class Connection:
     def alive(self):
         return self.sock is not None
 
-    def _send(self, command, arg0, arg1, data=b""):
+    def _send(self, command, arg0, arg1, data=b"", deadline=None):
         try:
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise socket.timeout("timed out")
+                self.sock.settimeout(left)
             self.sock.sendall(_pack(command, arg0, arg1, data))
+        except socket.timeout:
+            self.close()
+            raise
         except OSError as e:
             self.close()
             raise AdbError(f"send failed: {e}")
 
     def _read(self, size, deadline):
-        buf = b""
+        buf = bytearray()
         while len(buf) < size:
             left = deadline - time.monotonic()
             if left <= 0:
@@ -153,14 +161,17 @@ class Connection:
             if not chunk:
                 self.close()
                 raise AdbError("connection closed by the TV")
-            buf += chunk
-        return buf
+            buf.extend(chunk)
+        return bytes(buf)
 
     def _recv(self, deadline):
         command, arg0, arg1, length, _check, magic = struct.unpack("<6I", self._read(24, deadline))
         if magic != command ^ 0xFFFFFFFF:
             self.close()
             raise AdbError("not an adb answer")
+        if length > self.max_data:
+            self.close()
+            raise AdbError(f"ADB packet is too large ({length} bytes)")
         return command, arg0, arg1, self._read(length, deadline) if length else b""
 
     def connect(self, approval_wait=0.0):
@@ -170,8 +181,8 @@ class Connection:
             self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
         except OSError as e:
             raise AdbError(f"no connection: {e}")
-        self._send(A_CNXN, A_VERSION, MAX_DATA, b"host::\0")
         deadline = time.monotonic() + self.timeout
+        self._send(A_CNXN, A_VERSION, MAX_DATA, b"host::\0", deadline)
         signed = offered = False
         try:
             while True:
@@ -182,10 +193,10 @@ class Connection:
                 if command != A_AUTH or arg0 != AUTH_TOKEN:
                     raise AdbError("unexpected answer while logging in")
                 if not signed:
-                    self._send(A_AUTH, AUTH_SIGNATURE, 0, sign_token(self.key, data))
+                    self._send(A_AUTH, AUTH_SIGNATURE, 0, sign_token(self.key, data), deadline)
                     signed = True
                 elif not offered:  # the TV does not know this key: offer it and wait for the user's answer
-                    self._send(A_AUTH, AUTH_RSAPUBLICKEY, 0, public_key_blob(self.key))
+                    self._send(A_AUTH, AUTH_RSAPUBLICKEY, 0, public_key_blob(self.key), deadline)
                     offered = True
                     deadline = time.monotonic() + approval_wait
                     if approval_wait <= 0:
@@ -205,12 +216,12 @@ class Connection:
         """Run one shell command and return its output as text."""
         if not self.sock:
             raise AdbError("not connected")
+        deadline = time.monotonic() + timeout
         self._next_id += 1
         local = self._next_id
-        self._send(A_OPEN, local, 0, b"shell:" + command.encode() + b"\0")
-        deadline = time.monotonic() + timeout
-        out, remote = b"", 0
+        out, remote = bytearray(), 0
         try:
+            self._send(A_OPEN, local, 0, b"shell:" + command.encode() + b"\0", deadline)
             while True:
                 cmd, arg0, arg1, data = self._recv(deadline)
                 if arg1 != local:
@@ -218,9 +229,9 @@ class Connection:
                 if cmd == A_OKAY:
                     remote = arg0
                 elif cmd == A_WRTE:
-                    out += data
+                    out.extend(data)
                     remote = arg0
-                    self._send(A_OKAY, local, remote)
+                    self._send(A_OKAY, local, remote, deadline=deadline)
                 elif cmd == A_CLSE:
                     break
         except socket.timeout:

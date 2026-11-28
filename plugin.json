@@ -5,7 +5,7 @@
   "api_version": 1,
   "publish": {
     "tags": ["utility", "tv"],
-    "description": "CEC alternative over the network for a Sony Bravia TV: wakes it, switches its HDMI input and turns it off when a SteamOS HTPC wakes up, goes to sleep or shuts down. Also controls which USB devices can wake the PC.",
+    "description": "HDMI control for SteamOS: Sony Bravia via Sony IP API and Android/Google TVs with ADB. Switches to the PC HDMI on wake or PS button, sends the TV home or turns it off on sleep/shutdown, and manages USB wake sources.",
     "image": "https://raw.githubusercontent.com/MSPortnov/NetCEC/main/assets/store.png"
   }
 }

@@ -3,6 +3,7 @@ import os
 import stat
 import threading
 import unittest
+from unittest import mock
 
 from support import SettingsCase, main
 
@@ -125,6 +126,16 @@ class PluginApi(SettingsCase):
         self.assertNotIn("auth_cookie", out)
         self.assertNotIn("mac", out)
         self.assertTrue(out["paired"])
+        self.assertTrue(out["sony_paired"])
+
+    def test_changing_tv_address_discards_the_old_pairing(self):
+        main._save({**main.DEFAULTS, "ip": "10.0.0.5", "auth_cookie": "auth=OLD",
+                    "adb_ok": True, "mac": "aa:bb:cc:dd:ee:ff"})
+        plugin = main.Plugin()
+        with mock.patch.object(plugin, "_take_lock", new_callable=mock.AsyncMock):
+            self._run(plugin.set_settings({"ip": "10.0.0.6", "driver": "sony"}))
+        s = main._load()
+        self.assertEqual((s["auth_cookie"], s["adb_ok"], s["mac"]), ("", False, ""))
 
     def test_unpair_clears_everything_about_the_tv(self):
         main._save({**main.DEFAULTS, "ip": "10.0.0.5", "auth_cookie": "auth=SECRET", "mac": "aa:bb:cc:dd:ee:ff"})
@@ -151,7 +162,7 @@ class Migration(SettingsCase):
 
     def test_a_new_install_starts_at_the_current_version(self):
         s = main._load()
-        self.assertEqual(s["settings_version"], 5)
+        self.assertEqual(s["settings_version"], 8)
         self.assertEqual((s["suspend_action"], s["shutdown_action"]), ("off", "off"))
 
     # --- the first change (wake and switch merged)
@@ -198,7 +209,7 @@ class Migration(SettingsCase):
             saved = json.load(f)
         self.assertNotIn("off_only_if_active", saved)
         self.assertNotIn("switch_input", saved)
-        self.assertEqual(saved["settings_version"], 5)
+        self.assertEqual(saved["settings_version"], 8)
 
     def test_old_files_get_the_sony_driver(self):
         s = self.load(settings_version=4, suspend_action="home")

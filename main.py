@@ -24,6 +24,8 @@ import decky
 
 # The ADB client (Android TV) is optional: if it cannot be loaded, everything for Sony still works.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "py_modules"))
+import netcec_discovery
+import netcec_usb
 try:
     import netcec_adb
     _ADB_IMPORT_ERROR = ""
@@ -58,7 +60,8 @@ DEFAULTS = {
     "shutdown_action": "off",  # on power-off: off | home (only if the TV shows our HDMI port; never on a reboot)
     "driver": "sony",          # which kind of TV: sony (IP control) | adb (Android TV over ADB)
     "adb_ok": False,           # the TV has accepted our ADB key (set by the backend only)
-    "settings_version": 5,
+    "adb_inputs": {},          # HDMI port -> input id learned on this Android TV
+    "settings_version": 8,
     # USB wake sources: {"vid:pid": true|false}
     "wake_rules": {},
     "journal": False,          # keep (and show) the journal of recent actions; off: nothing is recorded
@@ -67,7 +70,7 @@ DEFAULTS = {
 }
 
 
-PRIVATE = ("auth_cookie", "mac", "adb_ok")  # stay in the backend, never sent to / accepted from the UI
+PRIVATE = ("auth_cookie", "mac", "adb_ok", "adb_inputs")  # never sent to / accepted from the UI
 
 LEAVE_ACTIONS = ("home", "off")  # what to do with the TV on sleep / shutdown (always one of them)
 _settings_lock = threading.RLock()  # every read-modify-write of the settings file holds it
@@ -100,7 +103,8 @@ _VALID = {
     "shutdown_action": lambda v: v in LEAVE_ACTIONS,
     "driver": lambda v: v in ("sony", "adb"),
     "adb_ok": _is_bool,
-    "settings_version": lambda v: v == 5,
+    "adb_inputs": lambda v: isinstance(v, dict),
+    "settings_version": lambda v: v == 8,
     "wake_rules": lambda v: isinstance(v, dict),
     "journal": _is_bool,
     "lang": lambda v: v in ("en", "ru"),
@@ -116,6 +120,11 @@ def _sanitize(raw) -> dict:
         v = raw.get(key, default)
         if key == "wake_rules":
             v = ({k: x for k, x in v.items() if isinstance(k, str) and _USB_ID_RE.fullmatch(k) and isinstance(x, bool)}
+                 if isinstance(v, dict) else {})
+        elif key == "adb_inputs":
+            v = ({k: x for k, x in v.items() if isinstance(k, str) and k in {"1", "2", "3", "4"}
+                  and isinstance(x, str) and re.fullmatch(
+                      r"(?:HW[A-Za-z0-9_.-]{1,64}|URI:[A-Za-z0-9%._:/+\-]{1,240})", x)}
                  if isinstance(v, dict) else {})
         elif not _VALID[key](v):
             v = default
@@ -149,8 +158,12 @@ def _migrate(data):
         for key in ("suspend_action", "shutdown_action"):
             if data.get(key) == "off_if_mine":
                 data[key] = "off"
-    # version 5 only added the "driver" and "adb_ok" settings: the defaults (a Sony TV) are right for old files
-    data["settings_version"] = 5
+    # version 5 added ADB pairing; version 6 added learned input IDs; version 7 restored Sony's
+    # API driver after the earlier temporary ADB test mode. Version 8 removes that Sony test mode;
+    # make sure an existing Sony API pairing uses the Sony driver.
+    if version < 8 and data.get("auth_cookie"):
+        data.update(driver="sony", adb_ok=False, adb_inputs={})
+    data["settings_version"] = 8
     return data
 
 
@@ -311,6 +324,11 @@ TR = {
         "switched": "Switched to HDMI {port}",
         "adb_approve": "Confirm on the TV: \u201cAllow USB debugging?\u201d, choose \u201cAlways allow\u201d, then press Connect again.",
         "adb_unavailable": "Android TV support is not available: {err}",
+        "adb_train_ok": "HDMI detection learned for: {ports}",
+        "adb_train_partial": "Learned: {ports}. Could not identify: {missing}",
+        "adb_train_none": "The TV did not expose a stable active HDMI identifier. No mapping was saved.",
+        "adb_train_restore_failed": "HDMI IDs were learned, but the TV did not confirm a return to HDMI {port}.",
+        "sony_api_required": "Sony Bravia uses Sony IP control here. Enable IP control and pair with the PIN.",
         "what_undetectable": "input could not be determined",
         "switched_in": "Switched to HDMI {port} in {secs} s",
         "ip_changed": "TV found at its new address {ip}",
@@ -355,6 +373,11 @@ TR = {
         "switched": "Переключено на HDMI {port}",
         "adb_approve": "Подтвердите на ТВ запрос \u00abРазрешить отладку\u00bb (выберите \u00abВсегда разрешать\u00bb) и нажмите \u00abПодключить\u00bb ещё раз.",
         "adb_unavailable": "Поддержка Android TV недоступна: {err}",
+        "adb_train_ok": "Определение HDMI обучено для портов: {ports}",
+        "adb_train_partial": "Обучено: {ports}. Не удалось определить: {missing}",
+        "adb_train_none": "Телевизор не выдал устойчивый идентификатор активного HDMI. Таблица не сохранена.",
+        "adb_train_restore_failed": "Входы обучены, но ТВ не подтвердил возврат на HDMI {port}.",
+        "sony_api_required": "Sony Bravia здесь работает через Sony IP API. Включите IP-управление и выполните сопряжение по PIN.",
         "what_undetectable": "вход определить не удалось",
         "switched_in": "Переключено на HDMI {port} за {secs} с",
         "ip_changed": "ТВ найден по новому адресу {ip}",
@@ -572,8 +595,22 @@ def _pair_start(s):
         code, cookie = _register(s)
     except Exception as e:
         if _port_open(s["ip"], ADB_PORT):  # no Sony API, but ADB answers: an Android TV
+            try:
+                if any(tv["ip"] == s["ip"] and tv["kind"] == "sony" for tv in _discover(timeout=1.0)):
+                    return _fail(_t("sony_api_required"))
+            except Exception:
+                pass
             s["driver"] = "adb"
-            return _adb_pair(s)
+            result = _adb_pair(s)
+            try:
+                adb_brand = _adb_brand(s) if result.get("ok") else "other"
+            except Exception:
+                adb_brand = "other"
+            if result.get("ok") and adb_brand == "sony":
+                _update(lambda cur: cur.update(driver="sony", adb_ok=False, adb_inputs={}))
+                s.update(driver="sony", adb_ok=False, adb_inputs={})
+                return _fail(_t("sony_api_required"))
+            return result
         return _fail(_t("no_conn", err=e))
     if code == 401:
         return _ok(_t("pin_enter"))
@@ -747,9 +784,9 @@ _adb_lock = threading.RLock()
 _adb_state = {"ip": None, "conn": None, "used": 0.0, "key": None, "brand": {}}
 
 # one round trip: power state, the last HDMI input that was opened, the activity in front
-_ADB_LOOK_CMD = ("dumpsys power | grep -m1 mWakefulness=; echo '##starter'; "
-                 "dumpsys activity starter | grep -o 'HW[0-9]*' | head -3; echo '##resumed'; "
-                 "dumpsys activity activities | grep -m2 -E 'topResumedActivity|mResumedActivity'")
+_ADB_LOOK_CMD = ("dumpsys power | sed -n '/mWakefulness=/p' | sed -n '1p'; echo '##starter'; "
+                 "dumpsys activity starter | grep -E 'mIntent=|dat=content://|HW[0-9]'; "
+                 "echo '##resumed'; dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'")
 
 
 def _adb_key():
@@ -797,11 +834,11 @@ def _adb_brand(s):
     brands = _adb_state["brand"]
     if s["ip"] not in brands:
         out = _adb_shell(s, "getprop ro.product.manufacturer; getprop ro.product.brand", 3.0).lower()
-        brands[s["ip"]] = "tcl" if "tcl" in out else "other"
+        brands[s["ip"]] = "sony" if "sony" in out else ("tcl" if "tcl" in out else "other")
     return brands[s["ip"]]
 
 
-def _adb_parse_look(text, hw_ports):
+def _adb_parse_look(text, hw_ports, learned_ports=None):
     """(port, what) from the output of _ADB_LOOK_CMD: the port the TV shows, 0 = something else, -1 = the TV is on
     but the input cannot be told, None = the TV is off."""
     power = re.search(r"mWakefulness=(\w+)", text)
@@ -812,24 +849,151 @@ def _adb_parse_look(text, hw_ports):
     parts = text.split("##starter", 1)[-1].split("##resumed", 1)
     starter, resumed = parts[0], (parts[1] if len(parts) > 1 else "")
     shown = " ".join(resumed.split())[:80]
-    if not any(word in resumed.lower() for word in ("tvinput", "passthrough", "hdmi")):
+    source_ids = _adb_input_tokens(starter)
+    on_input = any(word in resumed.lower() for word in ("tvinput", "passthrough", "hdmi", "com.sony.dtv.tvx"))
+    if not on_input:
         return 0, f"awake, not on an input ({shown or 'no activity'})"
+    learned_ports = learned_ports or {}
+    learned_source_ports = {source: int(port) for port, source in learned_ports.items()}
     for hw in re.findall(r"HW\d+", starter):  # the most recently opened input first
         if hw in hw_ports:
             return hw_ports[hw], f"hdmi {hw_ports[hw]} ({hw})"
-    return -1, f"on an input, which one is unknown ({shown})"
+    for source in _adb_input_tokens(starter):
+        if source in learned_source_ports:
+            port = learned_source_ports[source]
+            return port, f"hdmi {port} (learned source)"
+    detail = f", source {source_ids[0][:48]}" if len(source_ids) == 1 else ""
+    return -1, f"on an input, which one is unknown{detail} ({shown})"
 
 
-def _adb_look(s, timeout=4):
+def _adb_look(s, timeout=4, log=True):
     try:
         brand = _adb_brand(s)
         out = _adb_shell(s, _ADB_LOOK_CMD, max(timeout, 3.0))
     except Exception as e:
         return None, f"no answer ({type(e).__name__})"
     hw_ports = {hw: port for port, hw in ANDROID_TV_INPUTS.get(brand, {}).get("hw", {}).items()}
-    port, what = _adb_parse_look(out, hw_ports)
-    _log(f"adb look: {what} | {' '.join(out.split())[:240]}")  # the raw answer, to calibrate the detection
+    learned_ports = s.get("adb_inputs", {})
+    port, what = _adb_parse_look(out, hw_ports, learned_ports)
+    if log:
+        _log(f"adb look: {what} | {' '.join(out.split())[:1000]}")
     return port, what
+
+
+def _adb_source_id(text):
+    """Stable current input ID, only when a TV input activity is in front."""
+    parts = text.split("##starter", 1)[-1].split("##resumed", 1)
+    starter, resumed = parts[0], (parts[1] if len(parts) > 1 else "")
+    lower = resumed.lower()
+    if not any(word in lower for word in ("tvinput", "passthrough", "hdmi", "com.sony.dtv.tvx")):
+        return None
+    ids = _adb_input_tokens(starter)
+    return ids[0] if len(ids) == 1 else None
+
+
+def _adb_input_tokens(starter):
+    """Stable IDs exposed by Android's current input intent; prefer the full TIF URI."""
+    uris = list(dict.fromkeys(re.findall(
+        r"content://android\.media\.tv/passthrough/[^\s}\"']+", starter, re.IGNORECASE)))
+    # Some TVs print the same intent twice, with path separators encoded in one copy and
+    # decoded in the other (Sony: HW5 appears as both %2F...%2FHW5 and /.../HW5).
+    # Normalize first; genuinely different source IDs remain ambiguous and are rejected.
+    normalized = list(dict.fromkeys(urllib.parse.unquote(uri) for uri in uris))
+    if len(normalized) == 1:
+        return ["URI:" + normalized[0]]
+    if len(normalized) > 1:
+        return []
+    return list(dict.fromkeys(re.findall(r"\bHW\d+\b|\bHDMI[_-]?[1-9]\d*\b", starter, re.IGNORECASE)))
+
+
+def _adb_read_source_id(s):
+    out = _adb_shell(s, _ADB_LOOK_CMD, 4.0)
+    return _adb_source_id(out)
+
+
+def _adb_train_inputs(s):
+    """Visit HDMI 1–4, learn stable per-port source IDs, then restore the configured port."""
+    if not _is_adb(s) or not _paired(s):
+        return _fail(_t("not_paired"))
+    try:
+        if _adb_power_state(s) != "active":
+            return _fail(_t("adb_train_none"))
+        _update(lambda cur: cur.update(adb_inputs={}))  # discard stale IDs before this calibration
+        s["adb_inputs"] = {}
+        _t_home(s)  # start from a known non-HDMI screen so a stale source ID cannot be learned
+        time.sleep(0.5)
+        if _adb_read_source_id(s) is not None:
+            return _fail(_t("adb_train_none"))
+        learned, previous = {}, None
+        for port in range(1, 5):
+            try:
+                _adb_switch(s, port)
+            except Exception as e:
+                _log(f"ADB HDMI training: HDMI {port} command failed: {e}")
+                continue
+            started, candidate, stable = time.monotonic(), None, 0
+            while time.monotonic() - started < 5.0 and not _stop.is_set():
+                time.sleep(0.35)
+                source = _adb_read_source_id(s)
+                if source and source == candidate:
+                    stable += 1
+                elif source:
+                    candidate, stable = source, 1
+                else:
+                    candidate, stable = None, 0
+                if stable >= 2:
+                    break
+            if stable < 2 or not candidate:
+                _log(f"ADB HDMI training: HDMI {port} has no stable source ID")
+                continue
+            if candidate == previous and port != int(s["hdmi_port"]):
+                _log(f"ADB HDMI training: HDMI {port} did not change source ({candidate})")
+                continue
+            if candidate in learned.values():
+                old_port = next(k for k, value in learned.items() if value == candidate)
+                learned.pop(old_port, None)
+                _log(f"ADB HDMI training: duplicate source {candidate} for HDMI {old_port}/{port}; ignored")
+                continue
+            learned[port] = candidate
+            previous = candidate
+            _log(f"ADB HDMI training: HDMI {port} -> {candidate}")
+
+        if learned:
+            mapping = {str(k): v for k, v in learned.items()}
+            _update(lambda cur: cur.update(adb_inputs=mapping))
+            s["adb_inputs"] = mapping
+
+        target = int(s["hdmi_port"])
+        restored = False
+        try:
+            _adb_switch(s, target)
+            expected = learned.get(target)
+            if expected:
+                started, candidate, stable = time.monotonic(), None, 0
+                while time.monotonic() - started < 5.0 and not _stop.is_set():
+                    time.sleep(0.35)
+                    source = _adb_read_source_id(s)
+                    if source == expected:
+                        stable += 1
+                        if stable >= 2:
+                            restored = True
+                            break
+                    else:
+                        stable = 0
+        except Exception as e:
+            _log(f"ADB HDMI training: could not restore HDMI {target}: {e}")
+        found = ", ".join(f"HDMI {p}" for p in sorted(learned))
+        missing = ", ".join(f"HDMI {p}" for p in range(1, 5) if p not in learned)
+        if not learned:
+            return _fail(_t("adb_train_none"))
+        if target in learned and not restored:
+            return _fail(_t("adb_train_restore_failed", port=target))
+        if missing:
+            return _fail(_t("adb_train_partial", ports=found, missing=missing))
+        return _ok(_t("adb_train_ok", ports=found))
+    except Exception as e:
+        _log(f"ADB HDMI training failed: {type(e).__name__}: {e}")
+        return _fail(_t("adb_train_none"))
 
 
 def _adb_power_state(s):
@@ -887,8 +1051,8 @@ def _adb_pair(s):
         return _fail(_t("adb_approve"))
     except Exception as e:
         return _fail(_t("no_conn", err=e))
-    _update(lambda cur: cur.update(driver="adb", adb_ok=True))
-    s["driver"], s["adb_ok"] = "adb", True
+    _update(lambda cur: cur.update(driver="adb", adb_ok=True, adb_inputs={}))
+    s["driver"], s["adb_ok"], s["adb_inputs"] = "adb", True, {}
     _learn_mac(s)
     return _ok(_t("paired"))
 
@@ -908,7 +1072,7 @@ def _t_look(s, timeout):
 
 
 def _t_current_port(s, timeout=4):
-    return _adb_look(s, timeout)[0] if _is_adb(s) else _current_port(s, timeout=timeout)
+    return _adb_look(s, timeout, log=False)[0] if _is_adb(s) else _current_port(s, timeout=timeout)
 
 
 def _t_back(s):
@@ -978,9 +1142,14 @@ def _t_off(s):
 
 
 def _t_verifies(s):
-    """Can the TV tell which input it shows? Sony can; the answer of an Android TV is only a guess, so a switch
-    there is taken as done when the command went through."""
-    return not _is_adb(s)
+    """Only report an input as confirmed when its current ID is known to match that HDMI port."""
+    if not _is_adb(s):
+        return True
+    try:
+        brand = _adb_state["brand"].get(s.get("ip"), "other")
+        return brand in ANDROID_TV_INPUTS or str(int(s["hdmi_port"])) in s.get("adb_inputs", {})
+    except Exception:
+        return False
 
 
 SEND_TIMEOUT = 2      # seconds for every request to the TV while waking / switching
@@ -1043,8 +1212,8 @@ def _tv_fast(s):
                 sends += 1
                 _learn_mac(s)
                 if not _t_verifies(s):  # the command went through and that is all this kind of TV can tell
-                    _log(f"TV: HDMI {port} switch command sent, {time.monotonic() - t0:.1f} s ({summary()})")
-                    return _ok(_t("switched_in", port=port, secs=f"{time.monotonic() - t0:.1f}"))
+                    _log(f"TV: HDMI {port} command sent, not yet verified, {time.monotonic() - t0:.1f} s ({summary()})")
+                    return _ok(_t("sent_unconfirmed", port=port))
                 t1, confirmed = time.monotonic(), False
                 while time.monotonic() - t1 < CONFIRM_WINDOW and not _stop.is_set():
                     time.sleep(CONFIRM_STEP)
@@ -1208,44 +1377,16 @@ def _parse_tv_description(xml_text):
 def _discover(timeout=3.0):
     """TVs on the local network: Sony Bravias and Android TVs with network debugging on.
     [{"ip", "name", "model", "kind"}], kind is "sony" or "adb"."""
-    try:
-        locations = _ssdp_search(timeout)
-    except Exception as e:
-        _log(f"SSDP search failed: {e}")
-        return []
-
-    found = {}
-
-    def check(ip, device_locations):
-        cast = None  # an Android TV answers as a Chromecast (DIAL) device
-        for location in device_locations:
-            xml = _fetch_description(ip, location)
-            info = _parse_tv_description(xml) if xml else None
-            if info:
-                found[ip] = {"ip": ip, "name": info[0], "model": info[1], "kind": "sony"}
-                return
-            if xml:
-                if cast is None and "dial-multiscreen-org" in xml:
-                    cast = (_xml_text(xml, "friendlyName"), _xml_text(xml, "modelName"), _xml_text(xml, "manufacturer"))
-                _log(f"SSDP: {ip} {location}: not a Bravia (manufacturer={_xml_text(xml, 'manufacturer') or '?'}, "
-                     f"model={_xml_text(xml, 'modelName') or '?'}, scalar-api={'ScalarWebAPI' in xml})")
-        if cast and netcec_adb is not None and _port_open(ip, ADB_PORT):  # network debugging is on: usable
-            found[ip] = {"ip": ip, "name": cast[0], "model": cast[1] or cast[2], "kind": "adb"}
-
-    threads = [threading.Thread(target=check, args=item, daemon=True) for item in list(locations.items())[:16]]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(6)
-    tvs = list(found.values())
-    tvs.sort(key=lambda t: ("bravia" not in (t["name"] + t["model"]).lower(), t["ip"]))
-    _log(f"SSDP: {len(locations)} device(s) answered, {len(tvs)} TV(s) found")
-    return tvs
+    return netcec_discovery.discover(
+        timeout, _ssdp_search, _fetch_description, _parse_tv_description, _xml_text,
+        _port_open, netcec_adb is not None, ADB_PORT, _log,
+    )
 
 
 # ---------- sleep / shutdown helpers ----------
 
 SLEEP_POLL = 0.5     # resume detector tick (s)
+SLEEP_DETECT_THRESHOLD = 8.0  # clock-only fallback when the kernel suspend counter is unavailable
 SLEEP_BUDGET = 4.0   # logind waits at most 5 s for our lock
 LOCK_ARGS = [
     "systemd-inhibit", "--what=sleep:shutdown", "--who=NetCEC",
@@ -1280,55 +1421,15 @@ def _pdeathsig():
 # ---------- USB wake sources ----------
 
 def _rd(path):
-    try:
-        with open(path) as f:
-            return f.read().strip()
-    except Exception:
-        return ""
+    return netcec_usb.read(path)
 
 
 def _usb_devices():
-    devs = {}
-    try:
-        names = sorted(os.listdir(USB_PATH))
-    except Exception:
-        return []
-    for name in names:
-        if ":" in name:
-            continue  # interface entries
-        d = os.path.join(USB_PATH, name)
-        wk = os.path.join(d, "power", "wakeup")
-        vid, pid = _rd(os.path.join(d, "idVendor")), _rd(os.path.join(d, "idProduct"))
-        if not os.path.exists(wk) or not vid:
-            continue
-        cls = _rd(os.path.join(d, "bDeviceClass"))
-        if cls == "09":  # hubs
-            continue
-        key = f"{vid}:{pid}"
-        label = " ".join(x for x in (_rd(os.path.join(d, "manufacturer")), _rd(os.path.join(d, "product"))) if x) or key
-        e = devs.setdefault(key, {"id": key, "name": label, "wake": False, "bt": cls == "e0", "paths": []})
-        e["paths"].append(wk)
-        if _rd(wk) == "enabled":
-            e["wake"] = True
-    return sorted(devs.values(), key=lambda x: (not x["bt"], x["name"].lower()))
+    return netcec_usb.devices(USB_PATH, _rd)
 
 
 def _usb_set(dev_id, enabled):
-    n = 0
-    for d in _usb_devices():
-        if d["id"] == dev_id:
-            want = "enabled" if enabled else "disabled"
-            for p in d["paths"]:
-                if _rd(p) == want:  # already as wanted: do not write
-                    n += 1
-                    continue
-                try:
-                    with open(p, "w") as f:
-                        f.write(want)
-                    n += 1
-                except Exception:
-                    pass
-    return n
+    return netcec_usb.set_device(dev_id, enabled, _usb_devices, _rd)
 
 
 def _apply_wake_rules(s):
@@ -1368,309 +1469,5 @@ async def _resume_all():
     return res
 
 
-class Plugin:
-    _lock = None   # systemd-inhibit process holding the sleep/shutdown delay lock
-    _lock_mutex = None  # makes taking the lock atomic (two quick calls must not start two)
-    _mon = None    # dbus-monitor process (logind signals)
-    _tasks = ()
-    _bg = set()
-    _sleep_fut = None   # sleep actions of the current sleep (shared by the Steam hook and logind)
-    _sleep_ts = 0.0
-    _last_suspends = None  # the kernel's count of finished suspend attempts at the last handled resume
-    _plain_task = None
-    _meta_ts = 0.0
-
-    def _spawn(self, coro):
-        t = asyncio.get_event_loop().create_task(coro)
-        self._bg.add(t)
-        t.add_done_callback(self._bg.discard)
-        return t
-
-    # ----- journal
-    async def get_events(self) -> list:
-        def read():
-            return _read_events()[:5] if _load()["journal"] else []
-        return await asyncio.to_thread(read)
-
-    # ----- settings / info
-    async def get_settings(self) -> dict:
-        s = _load()
-        out = {k: v for k, v in s.items() if k not in PRIVATE}  # the UI never sees the pairing key
-        out["paired"] = _paired(s)
-        return out
-
-    async def set_settings(self, patch: dict) -> None:
-        def apply(s):
-            for k, v in (patch or {}).items():
-                if k in DEFAULTS and k not in PRIVATE and _VALID[k](v):
-                    s[k] = v
-                else:
-                    _log(f"settings: ignored {k!r}")
-        await asyncio.to_thread(_update, apply)
-        if (patch or {}).get("journal") is False:
-            await asyncio.to_thread(_clear_events)  # switched off: nothing stays behind
-        await self._take_lock()
-
-    async def get_info(self) -> dict:
-        return {
-            "root": os.geteuid() == 0,
-            "monitor": bool(self._mon and self._mon.returncode is None),
-            "lock": bool(self._lock and self._lock.returncode is None),
-        }
-
-    # ----- TV
-    async def find_tvs(self) -> list:
-        return await asyncio.to_thread(_discover)
-
-    async def pair_start(self) -> dict:
-        return await asyncio.to_thread(_pair_start, _load())
-
-    async def pair_finish(self, pin: str) -> dict:
-        result = await asyncio.to_thread(_pair_finish, _load(), pin)
-        if result.get("ok"):
-            await self._take_lock()  # a TV is paired now: sleep and shutdown have something to do
-        return result
-
-    async def tv_status(self) -> dict:
-        return await asyncio.to_thread(_status, _load())
-
-    async def tv_unpair(self) -> dict:
-        await asyncio.to_thread(_adb_drop)
-        await asyncio.to_thread(_update, lambda s: s.update(ip="", auth_cookie="", mac="", adb_ok=False, driver="sony"))
-        await self._take_lock()  # nothing to do any more: release the lock
-        return _ok(_t("unpaired"))
-
-    # ----- USB wake sources
-    async def usb_list(self) -> list:
-        return await asyncio.to_thread(_public_usb)
-
-    async def usb_set(self, dev_id: str, enabled: bool) -> list:
-        if isinstance(dev_id, str) and _USB_ID_RE.fullmatch(dev_id):
-            await asyncio.to_thread(_update, lambda s: s.update(wake_rules={**s["wake_rules"], dev_id: bool(enabled)}))
-            await asyncio.to_thread(_usb_set, dev_id, bool(enabled))
-        return await asyncio.to_thread(_public_usb)
-
-    # ----- sleep / shutdown lock (systemd delay inhibitor)
-    async def _take_lock(self):
-        if self._lock_mutex is None:
-            self._lock_mutex = asyncio.Lock()
-        async with self._lock_mutex:
-            s = await asyncio.to_thread(_load)
-            need = _paired(s)  # something to do for a paired TV
-            if not need:
-                await self._release_lock()
-                return
-            if self._lock and self._lock.returncode is None:
-                return
-            try:
-                self._lock = await asyncio.create_subprocess_exec(
-                    *_exe(LOCK_ARGS), stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, env=_env(),
-                    preexec_fn=_pdeathsig, start_new_session=True)
-                _log("sleep/shutdown lock taken")
-            except Exception as e:
-                self._lock = None
-                _log(f"could not take lock: {e}")
-
-    async def _release_lock(self):
-        p, self._lock = self._lock, None
-        if p and p.returncode is None:
-            _kill_group(p)  # no waiting for the exit: nothing here may block
-            _log("sleep/shutdown lock released")
-
-    # ----- resume handling
-    async def _handle_resume(self, source: str) -> dict:
-        """Single entry for "the device woke up". Three sources report it: logind (the main one), the Steam UI
-        event and the clock-jump detector (fallbacks). Each real wake-up is handled exactly once: the kernel
-        counts finished suspend attempts, so a source that reports the same count again is a duplicate. Without
-        the counter, duplicates within 20 s are dropped."""
-        global _last_resume
-        count = _suspend_count()
-        if count is not None:
-            duplicate = count == self._last_suspends
-            self._last_suspends = count
-        else:
-            now = time.time()
-            duplicate = now - _last_resume < 20
-            if not duplicate:
-                _last_resume = now
-        if duplicate:
-            _log(f"resume ({source}) skipped: duplicate")
-            return {**_ok(_t("dup")), "skipped": True}
-        self._sleep_fut, self._sleep_ts = None, 0.0  # a new sleep after this resume must not be skipped
-        _log(f"resume ({source})")
-        res = await _resume_all()
-        _record_result("wake", res)
-        return res
-
-    async def on_resume(self) -> dict:  # Steam UI event (fallback path)
-        return await self._handle_resume("steam-event")
-
-    async def _sleep_run(self, source: str):
-        """Run configured TV actions before sleep."""
-        s = _load()
-        try:
-            tv = await asyncio.to_thread(_tv_suspend, s)
-        except Exception as e:
-            _log(f"sleep actions ({source}): tv error: {e}")
-            return _fail(str(e))
-        _log(f"sleep actions ({source}): tv={tv}")
-        _record_result("sleep", tv)
-        return tv
-
-    def _sleep_recent(self) -> bool:
-        return self._sleep_fut is not None and time.time() - self._sleep_ts < 10
-
-    async def on_suspend(self, source: str = "steam-event") -> dict:
-        """Steam UI announces the sleep BEFORE logind: the network is still up here, whereas
-        NetworkManager shuts it down at the same moment logind signals PrepareForSleep."""
-        if self._sleep_recent():
-            _log(f"suspend ({source}): skipped, already handled")
-            return {**_ok(_t("dup")), "skipped": True}
-        self._sleep_ts = time.time()
-        self._sleep_fut = asyncio.ensure_future(self._sleep_run(source))
-        r = await self._sleep_fut
-        return r or _ok(_t("nothing"))
-
-    async def _on_logind(self, kind: str, going_down: bool, typ=None):
-        _log(f"logind: {kind} {'start' if going_down else 'end'}" + (f" (type={typ})" if typ else ""))
-        if going_down:
-            try:
-                if kind == "sleep":
-                    if self._sleep_recent():
-                        _log("sleep: actions already started by a Steam UI hook, waiting for them")
-                    else:
-                        self._sleep_ts = time.time()
-                        self._sleep_fut = asyncio.ensure_future(self._sleep_run("logind"))
-                    r = await asyncio.wait_for(asyncio.shield(self._sleep_fut), SLEEP_BUDGET)
-                else:
-                    r = await asyncio.wait_for(asyncio.to_thread(_tv_shutdown, _load(), typ), SLEEP_BUDGET)
-                    _record_result("shutdown", r)
-                _log(f"{kind}: {r}")
-            except asyncio.TimeoutError:
-                _log(f"{kind}: actions timed out")
-            except Exception as e:
-                _log(f"{kind}: failed: {e}")
-            await self._release_lock()  # let logind continue
-        elif kind == "sleep":
-            await self._take_lock()
-            await self._handle_resume("logind")
-
-    async def _handle_signal(self, member: str, lines):
-        text = "".join(lines)
-        m = re.search(r"boolean\s+(true|false)", text)
-        if not m:
-            return
-        start = m.group(1) == "true"
-        if member == "PrepareForSleep":
-            await self._on_logind("sleep", start)
-        elif member == "PrepareForShutdownWithMetadata":
-            tm = re.search(r'string\s+"type"\s+variant\s+string\s+"([^"]+)"', text)
-            typ = tm.group(1) if tm else None
-            if typ is None:
-                _log(f"shutdown metadata not parsed: {text!r}")
-            self._meta_ts = time.time()
-            if self._plain_task:
-                self._plain_task.cancel()
-            if start:
-                await self._on_logind("shutdown", True, typ)
-        elif member == "PrepareForShutdown" and start:
-            # systemd >= 257 follows with ...WithMetadata (reboot vs poweroff); wait briefly for it
-            self._plain_task = self._spawn(self._plain_shutdown())
-
-    async def _plain_shutdown(self):
-        await asyncio.sleep(0.8)
-        if time.time() - self._meta_ts > 2:
-            await self._on_logind("shutdown", True, None)
-
-    async def _logind_loop(self):
-        """Follow logind's PrepareForSleep / PrepareForShutdown(WithMetadata) via dbus-monitor."""
-        while True:
-            proc = None
-            try:
-                proc = self._mon = await asyncio.create_subprocess_exec(
-                    *_exe(MONITOR_ARGS), stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL, env=_env(), preexec_fn=_pdeathsig)
-                _log("logind watcher started")
-                member, lines = None, []
-
-                async def flush():
-                    nonlocal member, lines
-                    m, ls = member, lines
-                    member, lines = None, []
-                    if m:
-                        await self._handle_signal(m, ls)
-
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(proc.stdout.readline(), 0.2)
-                    except asyncio.TimeoutError:
-                        await flush()  # the arguments of a signal have all arrived
-                        continue
-                    if not raw:
-                        break
-                    line = raw.decode(errors="replace")
-                    if line.startswith("signal"):
-                        await flush()
-                        for name in ("PrepareForSleep", "PrepareForShutdownWithMetadata", "PrepareForShutdown"):
-                            if f"member={name}" in line:
-                                member = name
-                                break
-                    elif member:
-                        lines.append(line)
-                        if member == "PrepareForSleep" and "boolean" in line:
-                            await flush()  # no further arguments: act immediately
-                await flush()
-                _log("logind watcher ended")
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                _log(f"logind watcher error: {e}")
-            finally:
-                if proc and proc.returncode is None:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-            await asyncio.sleep(5)
-
-    async def _watch_sleep(self):
-        """Fallback: BOOTTIME advances during suspend, MONOTONIC does not."""
-        boot, mono = _clocks()
-        while True:
-            await asyncio.sleep(SLEEP_POLL)
-            nboot, nmono = _clocks()
-            slept = (nboot - boot) - (nmono - mono)
-            boot, mono = nboot, nmono
-            if slept > 8:
-                _log(f"sleep detected (~{slept:.0f}s)")
-                try:
-                    await self._handle_resume("sleep-detector")
-                except Exception as e:
-                    _log(f"resume handling failed: {e}")
-
-    # ----- lifecycle
-    async def _startup(self):
-        # No fixed delay: _tv_fast keeps retrying until the network and the TV answer (up to 45 s)
-        r = await _resume_all()
-        _log(f"startup: {r}")
-        _record_result("wake", r)
-
-    async def _main(self):
-        _log(f"NetCEC loaded (root={os.geteuid() == 0})")
-        self._last_suspends = _suspend_count()
-        _log("resume duplicates are told apart by: " + ("the kernel suspend counter" if self._last_suspends is not None else "a 20 s timer"))
-        loop = asyncio.get_event_loop()
-        self._tasks = [loop.create_task(c) for c in
-                       (self._startup(), self._watch_sleep(), self._logind_loop())]
-        await self._take_lock()
-
-    async def _unload(self):
-        # Everything here is synchronous on purpose: nothing may keep Decky waiting for the plugin
-        _stop.set()
-        for t in list(self._tasks) + list(self._bg):
-            t.cancel()
-        _kill_group(self._mon)
-        _adb_drop()
-        await self._release_lock()
-        _log("NetCEC unloaded")
+from netcec_plugin import Plugin
+Plugin.bind(globals())

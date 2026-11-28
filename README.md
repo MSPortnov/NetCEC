@@ -2,14 +2,16 @@
 
 **English** · [Русский](README.ru.md)
 
-**NetCEC turns your TV on and off together with your SteamOS box** (Sony Bravia, or an Android TV such as TCL).
-When the box wakes up, the TV switches on and jumps to the right HDMI input. When the box goes to sleep or
-shuts down, the TV turns off (or goes back to its home screen). Everything works over your home network,
-so you don't need HDMI-CEC. It is a plugin for [Decky Loader](https://decky.xyz/) and is used in Game Mode.
+**NetCEC controls Sony Bravia and Android/Google TVs over your home network**, so you do not need HDMI-CEC.
+Sony uses its IP API; other Android/Google TVs use ADB when network debugging is available. On wake, the TV switches
+to the PC's HDMI. Pressing PS while the PC is already awake returns the TV from another input to the configured
+HDMI. On sleep or shutdown, the TV goes home or turns off. NetCEC is a [Decky Loader](https://decky.xyz/) plugin for Game Mode.
 
 ## What it can do
 
-- **On wake-up:** turns the TV on and switches it to your HDMI input when the box starts or wakes up from sleep.
+- **On wake-up:** turns the TV on and switches it to your HDMI input when the box starts or wakes from sleep.
+- **Press PS to return to the PC:** while the box is awake, switches the TV from another input to the configured
+  HDMI. If a DualSense Edge disconnected to save power, pressing PS reconnects it and then returns the TV to the PC.
 - **When going to sleep** and **when shutting down:** you choose one of two actions: send the TV to its Android TV
   home screen (so it does not show "No signal") or turn it off. A reboot never touches the TV.
 - **Leaves the TV alone if someone is watching something else:** both actions only run if the TV is on your
@@ -28,8 +30,8 @@ so you don't need HDMI-CEC. It is a plugin for [Decky Loader](https://decky.xyz/
 - A SteamOS device with Decky Loader installed.
 - A TV on the same network as the box, one of:
   - **Sony Bravia** (Android TV): controlled through Sony's IP control with a PIN. Tested.
-  - **Another Android TV / Google TV** (TCL and others): controlled over ADB (network debugging). The TCL is
-    supported with its own HDMI input table; other brands use the standard HDMI keys, which not every TV honors.
+  - **Android TV / Google TV models with ADB network debugging:** controlled over ADB. TCL has a built-in HDMI
+    input map; other TVs can learn their HDMI input IDs when they expose the active input over ADB.
 
 ## Installing and updating
 
@@ -76,20 +78,21 @@ The script is short, [read it here](install.sh) before you run it.
    over ADB; for Sony nothing changes.)
 5. Pick the **HDMI port** the box is plugged into. Then, in the three sections *On wake-up*, *When going to sleep*
    and *When shutting down*, choose what the TV should do. Under every choice the plugin shows in one sentence
-   what it will do.
+   what it will do. For ADB, press **Teach the plugin to detect HDMI ports**: the TV visits each input and returns
+   to the selected port.
 
 The pairing renews itself every time it is used. If it gets lost (for example you removed the device on the
 TV), the status will ask you to pair again.
 
 ### Android TV: what to know
 
-- Sony stays on its own, more precise control (it reports power and the shown input and needs no developer mode),
-  so a Sony TV that also has ADB is still controlled through Sony's IP control.
-- The Android TV is woken with the power-on key, switched to the HDMI port by opening the TV's own input link,
-  and sent to the home screen or to sleep with the Home / Sleep keys. A TV in standby must keep its network on.
-- The plugin cannot ask an Android TV for the shown input as precisely as Sony. When it cannot tell which input
-  is shown, it does not touch the TV on sleep or shutdown (the log line `adb look:` shows what the TV said).
-  Wake-up always switches the input.
+- Sony automatically uses Sony IP control; discovered Android/Google TVs use ADB. ADB network debugging must
+  be available on port 5555; the newer Wireless debugging mode with a separate pairing port is not supported yet.
+- On a paired Android/Google TV, press **Teach the plugin to detect HDMI ports**. The TV visits HDMI 1–4 and
+  returns to the selected port. The plugin learns only inputs it can read consistently over ADB. Some models may not
+  expose their current HDMI input; those inputs cannot be learned.
+- On wake, the plugin switches to the selected HDMI. After learning, it also checks whether the TV actually shows
+  that input; without confirmation it reports that the command was sent but not confirmed.
 
 ## Trying it without a TV
 

@@ -1,7 +1,7 @@
 {
   "name": "netcec",
-  "version": "1.5.2",
-  "description": "NetCEC: Sony Bravia control and USB wake sources for Decky Loader",
+  "version": "1.5.3",
+  "description": "NetCEC: Sony Bravia API and Android/Google TV ADB control, PS-button HDMI return, and USB wake sources",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/MSPortnov/NetCEC.git"

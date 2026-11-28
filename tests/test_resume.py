@@ -74,5 +74,30 @@ class SuspendCounter(unittest.TestCase):
             self.assertIsNone(main._suspend_count())
 
 
+class SleepDetector(SettingsCase):
+    def test_suspend_counter_detects_a_short_sleep_without_waiting_for_clock_threshold(self):
+        plugin = main.Plugin()
+        clock_samples = iter([(1.0, 1.0), (1.5, 1.5)])
+        counts = iter([3, 4])
+        sleep_calls = 0
+
+        async def stop_after_one_poll(_delay):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        async def scenario():
+            with mock.patch.object(main, "_clocks", side_effect=lambda: next(clock_samples)), \
+                    mock.patch.object(main, "_suspend_count", side_effect=lambda: next(counts)), \
+                    mock.patch.object(main.asyncio, "sleep", side_effect=stop_after_one_poll), \
+                    mock.patch.object(plugin, "_handle_resume", new_callable=mock.AsyncMock) as resume:
+                with self.assertRaises(asyncio.CancelledError):
+                    await plugin._watch_sleep()
+                resume.assert_awaited_once_with("sleep-detector")
+
+        asyncio.run(scenario())
+
+
 if __name__ == "__main__":
     unittest.main()
